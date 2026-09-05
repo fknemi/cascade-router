@@ -1,0 +1,56 @@
+model Intent {
+  id          String   @id @default(uuid())
+  name        String   @unique
+  domain      String
+  schemaJson  Json     @map("schema_json")
+  status      String   @default("active")
+  createdAt   DateTime @default(now()) @map("created_at")
+
+  sops        Sop[]
+  invariants  Invariant[]
+  embeddings  IntentEmbedding[]
+
+  @@map("intents")
+}
+
+model Sop {
+  id        String   @id @default(uuid())
+  intentId  String   @map("intent_id")
+  version   Int
+  content   String
+  status    String   @default("active")
+  createdAt DateTime @default(now()) @map("created_at")
+
+  intent Intent @relation(fields: [intentId], references: [id], onDelete: Cascade)
+
+  @@unique([intentId, version])
+  @@index([intentId, version])
+  @@map("sops")
+}
+
+model Invariant {
+  id        String   @id @default(uuid())
+  intentId  String   @map("intent_id")
+  version   Int
+  code      String
+  status    String   @default("active")
+  createdAt DateTime @default(now()) @map("created_at")
+
+  intent Intent @relation(fields: [intentId], references: [id], onDelete: Cascade)
+
+  @@unique([intentId, version])
+  @@index([intentId, version])
+  @@map("invariants")
+}
+model IntentEmbedding {
+  id          String   @id @default(uuid())
+  intentId    String   @map("intent_id")
+  name        String
+  description String
+  embedding   Json?
+  createdAt   DateTime @default(now()) @map("created_at")
+
+  intent Intent @relation(fields: [intentId], references: [id], onDelete: Cascade)
+
+  @@map("intent_embeddings")
+}

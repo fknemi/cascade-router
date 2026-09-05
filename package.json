@@ -3,13 +3,24 @@
   "module": "index.ts",
   "type": "module",
   "devDependencies": {
-    "@types/bun": "latest"
+    "@prisma/cli-engine": "0.2.3",
+    "@types/bun": "latest",
+    "@types/node": "^26.4.1",
+    "prisma": "^8.0.0-rc.10"
   },
   "peerDependencies": {
     "typescript": "^5.0.0"
   },
   "dependencies": {
+    "@prisma/orm-extension-pgvector": "^8.0.0-rc.8",
+    "@prisma/orm-postgres": "^8.0.0-rc.8",
     "axios": "^1.20.0",
-    "express": "^5.2.1"
+    "dotenv": "^17.4.2",
+    "express": "^5.2.1",
+    "pg": "^8.23.0"
+  },
+  "scripts": {
+    "contract:emit": "prisma contract emit",
+    "postinstall": "prisma skills sync || exit 0"
   }
 }
