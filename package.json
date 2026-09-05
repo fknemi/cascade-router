@@ -17,10 +17,14 @@
     "axios": "^1.20.0",
     "dotenv": "^17.4.2",
     "express": "^5.2.1",
-    "pg": "^8.23.0"
+    "pg": "^8.23.0",
+    "simple-git": "^3.36.0",
+    "zod": "^4.5.4"
   },
   "scripts": {
     "contract:emit": "prisma contract emit",
-    "postinstall": "prisma skills sync || exit 0"
+    "postinstall": "prisma skills sync || exit 0",
+    "ao-router": "bun main.js",
+    "test-draft": "bun scripts/test-draft.ts"
   }
 }
