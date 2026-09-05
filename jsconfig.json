@@ -1,0 +1,13 @@
+{
+  "compilerOptions": {
+    "module": "ESNext",
+    "moduleResolution": "node",
+    "target": "ESNext",
+    "lib": ["ESNext", "DOM"],
+    "checkJs": true,
+    "allowSyntheticDefaultImports": true
+  },
+  "typeAcquisition": {
+    "enable": true
+  }
+}
