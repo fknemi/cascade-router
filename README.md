@@ -4,31 +4,74 @@
 
 Instead of using an expensive LLM to judge another LLM's output, Cascade uses deterministic code checks. A cheap, fast "Student" model drafts answers. A verification gate checks them with real code (schema validation + Python invariants). If it passes, you get the answer in ~1.5s for $0.005. If it fails, Cascade auto-routes to a "Teacher" model (frontier-class) for the reliable path. Every Teacher success gets distilled into new invariants, so the system gets smarter over time.
 
-
 ---
 
 ## Quick Start
 
+**1. Install dependencies**
+
 ```bash
-# 1. Install dependencies
 bun install
 
-# 2. Set your API key
+```
+
+**2. Set your API key**
+
+```bash
 cp .env.example .env
 # Edit .env → add your DeepSeek API key
 
-# 3. Run the server
-bun main.ts
 ```
 
-Server starts at `http://localhost:3000`
+**3. Configure OpenCode Support**
+Cascade natively supports OpenCode. To route your OpenCode workspace through Cascade, add the following to your `opencode.json` or workspace config:
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "ao-router": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "AO Router",
+      "options": {
+        "baseURL": "http://localhost:3000/v1",
+        "apiKey": "local-router-key"
+      },
+      "models": {
+        "student": {
+          "id": "deepseek/deepseek-v4-flash",
+          "name": "Student (Fast Draft)"
+        },
+        "teacher": {
+          "id": "deepseek/deepseek-v4-flash",
+          "name": "Teacher (Reliable Fallback)"
+        },
+        "auto": {
+          "id": "deepseek/deepseek-v4-flash",
+          "name": "Cascade Router"
+        }
+      }
+    }
+  }
+}
+
+```
+
+**4. Run the server**
+
+```bash
+bun main.ts
+
+```
+
+*Server starts at `http://localhost:3000*`
 
 ---
 
 ## What It Does
 
 | Stage | What Happens |
-|-------|-------------|
+| --- | --- |
 | **Route** | Matches query to an intent profile (SOP + schema + invariants) |
 | **Draft** | Student model (cheap/fast) generates JSON output |
 | **Verify** | Layer 1 checks structure, Layer 2 runs Python invariant assertions |
@@ -51,6 +94,7 @@ curl -X POST http://localhost:3000/v1/chat/completions \
       {"role": "user", "content": "Reconcile invoice #1234 with PO #5678"}
     ]
   }'
+
 ```
 
 ### Streaming Response
@@ -65,6 +109,7 @@ curl -X POST http://localhost:3000/v1/chat/completions \
     ],
     "stream": true
   }'
+
 ```
 
 ### With Tools (Code Queries)
@@ -93,12 +138,14 @@ curl -X POST http://localhost:3000/v1/chat/completions \
       }
     ]
   }'
+
 ```
 
 ### Health Check
 
 ```bash
 curl http://localhost:3000/health
+
 ```
 
 ---
@@ -139,6 +186,7 @@ What a matched intent looks like internally:
     "layer2_invariant_code": "def verify_logic(payload, state):\n    je = payload.get('je', {})\n    assert je.get('dr') == '1010', 'Must use asset account 1010'\n    assert je.get('dr') != je.get('cr'), 'Debits and Credits must balance, not match'"
   }
 }
+
 ```
 
 ---
@@ -166,16 +214,17 @@ What a matched intent looks like internally:
     "cost_usd": 0.005
   }
 }
+
 ```
 
 ---
 
 ## Demo Talking Points
 
-- **"The moat is deterministic verification."** No LLM judging LLMs. Real code asserts real invariants.
-- **"Fast path is 8x cheaper and 10x faster."** ~$0.005 vs $0.12, ~1.5s vs ~12s.
-- **"It self-heals."** Every Teacher success becomes a new invariant. The gate gets stricter automatically.
-- **"Zero side effects during drafting."** Sandboxed execution — nothing commits until the gate passes.
+* **"The moat is deterministic verification."** No LLM judging LLMs. Real code asserts real invariants.
+* **"Fast path is 8x cheaper and 10x faster."** ~$0.005 vs $0.12, ~1.5s vs ~12s.
+* **"It self-heals."** Every Teacher success becomes a new invariant. The gate gets stricter automatically.
+* **"Zero side effects during drafting."** Sandboxed execution — nothing commits until the gate passes.
 
 ---
 
@@ -187,14 +236,13 @@ bun run contract:emit      # Emit Prisma contract
 bun scripts/test-gate.ts   # Test the verification gate
 bun scripts/test-router.ts # Test intent routing
 bun scripts/test-student.ts # Test Student model
+
 ```
 
 ---
 
 ## Troubleshooting
 
-**API key missing**: Set `DEEPSEEK_API_KEY` in `.env`
-
-**Tool call loop**: System caps tool rounds at 6, then forces a final answer. That's intentional.
-
-**Prisma not initialized**: Run `bun run contract:emit` first.
+* **API key missing**: Set `DEEPSEEK_API_KEY` in `.env`
+* **Tool call loop**: System caps tool rounds at 6, then forces a final answer. That's intentional.
+* **Prisma not initialized**: Run `bun run contract:emit` first.
