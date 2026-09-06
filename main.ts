@@ -48,6 +48,10 @@ function getCachedResponse(key: string): any | null {
   return null;
 }
 
+function deleteCachedResponse(key: string) {
+  responseCache.delete(key);
+}
+
 function setCachedResponse(key: string, result: any): void {
   responseCache.set(key, { result, timestamp: Date.now() });
   if (responseCache.size > 1000) {
@@ -208,7 +212,7 @@ function isAOInternalMessage(query: string): boolean {
 const DSML_BLOCK_PATTERN =
   /<｜｜DSML｜｜[^>]*>[\s\S]*?<\/｜｜DSML｜｜[^>]*>|<｜｜DSML｜｜[^>]*>/g;
 
-const DIRECT_ANSWER_HISTORY_LIMIT = 20;
+const DIRECT_ANSWER_HISTORY_LIMIT = 40; // Increased from 20 to reduce pair-breaking
 
 function sanitizeMessageContent(content: any): any {
   if (typeof content === "string") {
@@ -227,35 +231,45 @@ function sanitizeMessageContent(content: any): any {
   return content;
 }
 
-function sanitizeMessagesForDirectAnswer(messages: any[]): any[] {
-  const filteredMessages = messages.filter((m: any) => {
-    if (m.role === "assistant" && typeof m.content === "string") {
-      // Remove assistant messages that contain DSML tool calls
-      if (
-        m.content.includes("<｜｜DSML｜｜tool_calls>") ||
-        m.content.includes("<｜｜DSML｜｜invoke")
-      ) {
-        console.log(
-          "[Sanitize] Filtering out DSML tool call message from history",
-        );
-        return false;
+/**
+ * Trims an array of non‑system messages to `limit` entries,
+ * but ensures that any `tool` message at the start of the trimmed
+ * window is preceded by its corresponding assistant `tool_calls` message.
+ */
+function trimMessagesPreservingTools(messages: any[], limit: number): any[] {
+  if (messages.length <= limit) return messages;
+
+  let startIndex = messages.length - limit;
+  // Look for the first tool message in the trimmed range
+  for (let i = startIndex; i < messages.length; i++) {
+    if (messages[i].role === "tool") {
+      // Back up to find the preceding assistant message
+      let j = i - 1;
+      while (j >= 0 && messages[j].role !== "assistant") {
+        j--;
       }
+      // If that assistant message is before our current start, adjust
+      if (j >= 0 && j < startIndex) {
+        startIndex = j;
+      }
+      break; // Only need to fix the first orphan
     }
-    return true;
-  });
+  }
+  return messages.slice(startIndex);
+}
 
-  // Then apply existing sanitization
-  const systemMessages = filteredMessages.filter(
-    (m: any) => m.role === "system",
-  );
-  const nonSystemMessages = filteredMessages.filter(
-    (m: any) => m.role !== "system",
-  );
+function sanitizeMessagesForDirectAnswer(messages: any[]): any[] {
+  // We no longer filter out messages that contain DSML tool calls,
+  // because we now parse and return proper tool_calls to the client.
+  // Instead, we only sanitize content strings to remove any residual DSML.
 
-  const trimmedHistory =
-    nonSystemMessages.length > DIRECT_ANSWER_HISTORY_LIMIT
-      ? nonSystemMessages.slice(-DIRECT_ANSWER_HISTORY_LIMIT)
-      : nonSystemMessages;
+  const systemMessages = messages.filter((m: any) => m.role === "system");
+  const nonSystemMessages = messages.filter((m: any) => m.role !== "system");
+
+  const trimmedHistory = trimMessagesPreservingTools(
+    nonSystemMessages,
+    DIRECT_ANSWER_HISTORY_LIMIT,
+  );
 
   if (nonSystemMessages.length > DIRECT_ANSWER_HISTORY_LIMIT) {
     console.log(
@@ -449,7 +463,7 @@ async function callDeepSeekNonStreaming(
       messages,
       stream: false,
       temperature: options.temperature ?? 0.2,
-      max_tokens: options.max_tokens || 2000,
+      max_tokens: options.max_tokens || 4000,
     };
 
     const response = await axios.post(
@@ -534,7 +548,7 @@ async function callDeepSeekStreaming(
         messages,
         stream: true,
         temperature: options.temperature ?? 0.2,
-        max_tokens: options.max_tokens || 2000,
+        max_tokens: options.max_tokens || 8000,
       }),
     });
 
@@ -649,7 +663,7 @@ async function callDeepSeekRaw(
       messages,
       stream: false,
       temperature: options.temperature ?? 0.2,
-      max_tokens: options.max_tokens || 2000,
+      max_tokens: options.max_tokens || 4000,
     };
 
     if (options.tools && options.tools.length > 0) {
@@ -747,6 +761,14 @@ function extractJSON(text: string): any {
 
 // Format reconciliation response
 function formatReconciliationResponse(draft: any): string {
+  if (typeof draft === "string") {
+    return draft;
+  }
+  
+  if (typeof draft === "object" && draft !== null && Object.keys(draft).length === 0) {
+      return JSON.stringify(draft);
+  }
+
   if (!draft || typeof draft !== "object") {
     return JSON.stringify(draft);
   }
@@ -899,7 +921,7 @@ async function triggerLearningLoopOnNoIntent(
     const teacherRaw = await callDeepSeekNonStreaming(
       TEACHER_MODEL,
       teacherMessages,
-      { temperature: 0.1, max_tokens: 2000 },
+      { temperature: 0.1, max_tokens: 4000 },
     );
     const teacherDraft = extractJSON(teacherRaw);
 
@@ -968,48 +990,38 @@ async function cascadePipeline(
     const intentName = bundle.routing_metadata.intent_name;
     console.log(`[Cascade] Matched intent: ${intentName}`);
 
-    // Check if this is a code query
-    const codeKeywords = [
-      "write",
-      "create",
-      "implement",
-      "add",
-      "fix",
-      "update",
-      "modify",
-      "code",
-      "function",
-      "method",
-      "class",
-      "api",
-      "endpoint",
-      "placeholder",
-      "integrate",
-      "implement",
-      "refactor",
-      "debug",
-      "test",
-      "build",
-      "setup",
-      "configure",
-    ];
-
     const queryLower = userQuery.toLowerCase();
-    const isCodeQuery = codeKeywords.some((kw) => queryLower.includes(kw));
+    const isCodeQuery = [
+      "write", "create", "implement", "add", "fix", "update", "modify",
+      "code", "function", "method", "class", "api", "endpoint",
+      "placeholder", "integrate", "refactor", "debug", "test",
+      "build", "setup", "configure", "show api endpoints"
+    ].some((kw) => queryLower.includes(kw));
 
-    // If this is a code query that matched an auto-generated intent, skip cascade
-    if (isCodeQuery && intentName.includes("write_new_placehodler")) {
-      console.log(`[Cascade] Code query detected, skipping domain cascade`);
+    // Check if this is an unstructured code query that should be sent to the direct path
+    // OR if it's an auto-learned intent that failed to bootstrap properly (has weird names)
+    // "auto_learned" intents are generated dynamically and often lack a good schema, 
+    // leading to empty output that fails the gates.
+    const isMalformedIntent = intentName.includes("__system_reminder__") || 
+      bundle?.routing_metadata?.domain === "auto_learned" || 
+      bundle?.domain === "auto_learned" || 
+      /_\d{10,}$/.test(intentName) ||
+      (bundle?.verification_assets?.layer1_schema?.properties && Object.keys(bundle.verification_assets.layer1_schema.properties).length === 0) ||
+      (bundle?.verification_assets?.layer1_schema?.type === "object" && Object.keys(bundle.verification_assets.layer1_schema).length === 2 && bundle.verification_assets.layer1_schema.properties);
+    
+    // Check cache
+    const cacheKey = getCacheKey(userQuery, intentName);
+
+    // Ignore cache if malformed
+    if (isMalformedIntent || isCodeQuery) {
+      console.log(`[Cascade] Code query or malformed intent detected, skipping domain cascade for: ${intentName}`);
+      deleteCachedResponse(cacheKey); // Remove bad cache entry
       return {
         trace_id: traceId,
         path: "code_query",
         status: "forward_to_direct",
       };
     }
-
-    // Check cache
-    const cacheKey = getCacheKey(userQuery, intentName);
-    const cachedResult = getCachedResponse(cacheKey);
     if (cachedResult) {
       console.log(`[Cache] ✅ Hit for "${intentName}"`);
       return { ...cachedResult, cache_hit: true };
@@ -1055,7 +1067,7 @@ async function cascadePipeline(
       const studentRaw = await callDeepSeekNonStreaming(
         STUDENT_MODEL,
         studentMessages,
-        { temperature: 0.2, max_tokens: 1000 },
+        { temperature: 0.2, max_tokens: 4000 },
         studentSpan,
       );
       const studentDraft = extractJSON(studentRaw);
@@ -1180,7 +1192,7 @@ async function cascadePipeline(
         const teacherRaw = await callDeepSeekStreaming(
           TEACHER_MODEL,
           teacherMessages,
-          { temperature: 0.1, max_tokens: 2000 },
+          { temperature: 0.1, max_tokens: 8000 },
           teacherSpan,
         );
         const teacherDraft = extractJSON(teacherRaw);
@@ -1367,7 +1379,7 @@ app.post("/v1/chat/completions", async (req, res) => {
                 ? incomingTools
                 : undefined,
             tool_choice: incomingToolChoice,
-            max_tokens: 500,
+            max_tokens: 4000,
           },
           requestSpan,
         );
@@ -1506,25 +1518,24 @@ app.post("/v1/chat/completions", async (req, res) => {
           {
             tools: toolsToUse,
             tool_choice: toolChoiceToUse,
-            max_tokens: 2000,
+            max_tokens: 4000, // Increased from 2000
             temperature: 0.3,
           },
           requestSpan,
         );
 
-        // *** FIX: Parse DSML tool calls if present ***
+        // Parse DSML if present
         if (result.content && result.content.includes("<｜｜DSML｜｜tool_calls>")) {
           const parsed = extractToolCallsFromDSML(result.content);
           result.content = parsed.content;
           result.toolCalls = parsed.toolCalls;
         }
 
-        // Check for tool calls
+        // Check for tool calls first
         if (result.toolCalls && result.toolCalls.length > 0) {
           console.log(
             `[Router] Model requested ${result.toolCalls.length} tool call(s)`,
           );
-          // Return tool calls to client for execution
           return sendChatResponse(res, {
             traceId: cascadeResult.trace_id || randomUUID(),
             modelUsed: "deepseek-direct",
@@ -1536,80 +1547,60 @@ app.post("/v1/chat/completions", async (req, res) => {
           });
         }
 
-        // Check for empty or JSON-only response
-        if (
-          !result.content ||
-          result.content.trim() === "" ||
-          result.content.trim() === "{}" ||
-          result.content.trim() === "[]"
-        ) {
-          console.error(
-            "[Router] Empty or invalid response from DeepSeek, retrying...",
-          );
+        // Helper to detect too-short responses
+        const isTooShort = (text: string | null) =>
+          !text ||
+          text.trim().length < 10 ||
+          text.trim() === "{}" ||
+          text.trim() === "[]";
 
-          // Try with explicit instruction to provide text
-          const retryMessages = [
-            {
-              role: "system",
-              content:
-                "You are a helpful coding assistant. Analyze the user's question about their codebase and provide a detailed, natural text response. List any API endpoints you find in the codebase. Do NOT output JSON. Respond with helpful, actionable information.",
-            },
-            {
-              role: "user",
-              content: userQuery,
-            },
-          ];
+        if (isTooShort(result.content)) {
+          console.error("[Router] Response too short or empty, retrying with same history");
+
+          // Retry using the same directMessages, with higher max_tokens and stronger prompt
+          const retryMessages = directMessages.map((m: any) => ({
+            ...m,
+            content: m.role === "system"
+              ? m.content + "\n\nIMPORTANT: Provide a complete, detailed answer. Do not truncate."
+              : m.content,
+          }));
 
           const retryResult = await callDeepSeekRaw(
             STUDENT_MODEL,
             retryMessages,
             {
-              max_tokens: 2000,
+              tools: toolsToUse,
+              tool_choice: toolChoiceToUse,
+              max_tokens: 8000, // Even higher for retry
               temperature: 0.3,
             },
             requestSpan,
           );
 
-          if (
-            !retryResult.content ||
-            retryResult.content.trim() === "" ||
-            retryResult.content.trim() === "{}" ||
-            retryResult.content.trim() === "[]"
-          ) {
-            console.error("[Router] Still getting empty response");
-            res.once("finish", () => {
-              triggerLearningLoopOnNoIntent(
-                userQuery,
-                cascadeResult.trace_id || randomUUID(),
-              ).catch(() => {});
-            });
-            return sendChatResponse(res, {
-              traceId: cascadeResult.trace_id || randomUUID(),
-              modelUsed: "deepseek-direct",
-              content:
-                "I couldn't analyze your codebase at the moment. Please try again or check the server logs for more details.",
-              toolCalls: null,
-              finishReason: "stop",
-              isStreaming,
-              cascadeMetadata: { ...cascadeResult, error: "empty_response" },
-            });
-          }
+          // Replace result with retry
+          result.content = retryResult.content;
+          result.toolCalls = retryResult.toolCalls;
+          result.finishReason = retryResult.finishReason;
+        }
 
+        // If after retry still too short, fallback to error message
+        if (isTooShort(result.content)) {
+          console.error("[Router] Still getting too short response");
           res.once("finish", () => {
             triggerLearningLoopOnNoIntent(
               userQuery,
               cascadeResult.trace_id || randomUUID(),
             ).catch(() => {});
           });
-
           return sendChatResponse(res, {
             traceId: cascadeResult.trace_id || randomUUID(),
             modelUsed: "deepseek-direct",
-            content: retryResult.content,
-            toolCalls: retryResult.toolCalls,
-            finishReason: retryResult.finishReason,
+            content:
+              "I couldn't analyze your codebase at the moment. Please try again or check the server logs for more details.",
+            toolCalls: null,
+            finishReason: "stop",
             isStreaming,
-            cascadeMetadata: cascadeResult,
+            cascadeMetadata: { ...cascadeResult, error: "empty_response" },
           });
         }
 
@@ -1665,7 +1656,7 @@ app.post("/v1/chat/completions", async (req, res) => {
           ? "cascade-student"
           : "cascade-teacher";
 
-      if (!content || content.trim() === "" || content.trim() === "{}") {
+      if (!content || content.trim() === "") {
         console.error("[Router] Empty content after formatting draft");
         content =
           "I processed your request but couldn't format the response properly.";

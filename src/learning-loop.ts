@@ -4,6 +4,10 @@
 
 import { randomUUID } from 'crypto';
 import { Client } from 'pg';
+import axios from 'axios';
+import { existsSync, readFileSync } from 'fs';
+import { join } from 'path';
+import { homedir } from 'os';
 import {
   startChainSpan,
   startAgentSpan,
@@ -23,21 +27,46 @@ const DB_CONFIG = {
 };
 
 const OLLAMA_EMBED_URL = 'http://localhost:11434/api/embed';
-const OLLAMA_CHAT_URL  = 'http://localhost:11434/api/chat';
-const TEACHER_MODEL    = 'deepseek-v4-pro'; // match your actual model name
+const TEACHER_MODEL = 'deepseek-v4-pro'; // match your actual DeepSeek model name
 
 const MUTATION_CATCH_RATE_TARGET = 10; // 10/10 mutations must be caught
+
+// Helper to load DeepSeek API key from environment or opencode config
+function getDeepSeekApiKey(): string {
+  const envKey = process.env.DEEPSEEK_API_KEY;
+  if (envKey) return envKey;
+
+  const locations = [
+    join(homedir(), ".config", "opencode", "opencode.jsonc"),
+    join(homedir(), ".config", "opencode", "opencode.json"),
+    join(process.cwd(), "opencode.jsonc"),
+    join(process.cwd(), "opencode.json"),
+  ];
+
+  for (const loc of locations) {
+    try {
+      if (existsSync(loc)) {
+        const raw = readFileSync(loc, "utf-8");
+        const cleanRaw = raw
+          .replace(/\/\*[\s\S]*?\*\//g, "")
+          .replace(/(^|[^:])\/\/.*$/gm, "$1");
+        const config = JSON.parse(cleanRaw);
+        const deepseekProvider = config.provider?.["deepseek"];
+        const key = deepseekProvider?.options?.apiKey;
+        if (key) return key;
+      }
+    } catch (e) {
+      // ignore and continue
+    }
+  }
+  throw new Error("DeepSeek API key not found in environment or config");
+}
 
 interface LearningLoopResult {
   success: boolean;
   version?: number;
   mutation_catch_rate?: number;
   error?: string;
-  // True when a distillation attempt was made but failed some gate
-  // (reviewer or mutation rate) and the stub SOP/invariant was left in
-  // place rather than replaced. Only meaningful on the bootstrap path —
-  // Path B has no stub to fall back to, an unpromoted contract there
-  // just means the OLD active SOP/invariant stays active, same as before.
   stub_retained?: boolean;
 }
 
@@ -49,19 +78,6 @@ export class AsyncLearningLoop {
   }
 
   // ─── Main entry point ───────────────────────────────────────────────────
-  // intentId = null  → no match. Bootstrap a new intent (stub), THEN
-  //                     immediately attempt to distill/mutate/promote a
-  //                     real v1 contract on top of it. If distillation
-  //                     fails any gate, the stub stands — the intent is
-  //                     still matchable next time, it just keeps its
-  //                     placeholder SOP/invariant until a later run
-  //                     succeeds. This fallthrough is the change from
-  //                     before: previously this branch returned right
-  //                     after bootstrapNewIntent and never reached the
-  //                     distill/mutate/promote code below, even though
-  //                     that code has always been written to run
-  //                     unconditionally once it has an intentId.
-  // intentId = string → student failed on a known intent, distill + promote
   async run(
     userQuery: string,
     teacherResult: any,
@@ -98,22 +114,6 @@ export class AsyncLearningLoop {
         workingIntentId = newIntentId;
         setSpanAttributes(span, { status: 'bootstrapped', new_intent_id: newIntentId });
 
-        // Deliberately NOT returning here. Previously this function
-        // returned `{ success: true }` immediately once bootstrapNewIntent
-        // resolved, leaving the intent permanently on its stub SOP
-        // (`Execute the task: ${userQuery}`) and stub invariant
-        // (`isinstance(payload, dict)`) — real contract distillation only
-        // ever ran on Path B (known intentId). Falling through here means
-        // a fresh intent gets the same distill → mutate → review → promote
-        // treatment as an intent that's already been in production.
-        //
-        // teacherResult MUST be real structured JSON for this to be worth
-        // anything — distillNewContract does JSON.stringify(teacherResult)
-        // and hands it to an LLM writing a JSON-schema SOP and a Python
-        // validator. Prose (e.g. a conversational direct-answer response)
-        // will produce a garbage SOP/invariant here. It's the caller's
-        // responsibility to pass a JSON draft, not free text, when
-        // intentId is null and it wants more than the stub.
         if (!teacherResult || typeof teacherResult !== 'object') {
           console.log(
             '[LearningLoop] No usable teacherResult for distillation — stub stands',
@@ -141,11 +141,6 @@ export class AsyncLearningLoop {
           status: 'reviewer_failed',
           mutation_catch_rate: mutationResults.catchRate,
         });
-        // On the bootstrap path this means: the intent row, embedding,
-        // and stub SOP/invariant created by bootstrapNewIntent are still
-        // in place and still 'active' — nothing here rolls those back.
-        // The intent is matchable next time; it just won't have a
-        // reviewed SOP until a future run succeeds.
         return {
           success: false,
           mutation_catch_rate: mutationResults.catchRate,
@@ -195,10 +190,6 @@ export class AsyncLearningLoop {
     } catch (error: any) {
       console.error('[LearningLoop] Error:', error.message);
       setSpanAttributes(span, { status: 'error', error: error.message });
-      // If we bootstrapped successfully before hitting this error, the
-      // stub is still standing — say so, since the caller (main.ts) only
-      // logs this failure and has no other way to know whether a partial
-      // intent now exists in the DB.
       return { success: false, error: error.message, stub_retained: isBootstrap };
     } finally {
       endSpan(span);
@@ -280,13 +271,7 @@ export class AsyncLearningLoop {
         [embeddingId, newIntentId, intentName, description, vectorLiteral],
       );
 
-      // Insert stub SOP — replaced after first successful teacher execution.
-      // "Replaced" here means: if run()'s post-bootstrap distill/mutate/
-      // promote sequence succeeds, promoteToProduction() inserts a NEW
-      // sops row at version 2 and a NEW invariants row at version 2 (both
-      // computed as MAX(version)+1), and this version-1 stub is simply no
-      // longer the 'active' one returned by the router's version-ordered
-      // query. It is not deleted or updated in place.
+      // Insert stub SOP
       await client.query(
         `INSERT INTO sops (id, intent_id, version, content, status)
          VALUES ($1, $2, 1, $3, 'active')`,
@@ -528,38 +513,42 @@ export class AsyncLearningLoop {
     }
   }
 
-  // ─── LLM caller ─────────────────────────────────────────────────────────
+  // ─── LLM caller (now using DeepSeek API) ────────────────────────────────
   private async callLLM(
     prompt: string,
     maxTokens: number,
     _parentSpan?: any
   ): Promise<string> {
-    const res = await fetch(OLLAMA_CHAT_URL, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
+    const apiKey = getDeepSeekApiKey();
+    const url = 'https://api.deepseek.com/chat/completions';
+
+    const response = await axios.post(
+      url,
+      {
         model: TEACHER_MODEL,
-        stream: false,
-        options: { num_predict: maxTokens, temperature: 0.2 },
         messages: [{ role: 'user', content: prompt }],
-      }),
-    });
+        stream: false,
+        temperature: 0.2,
+        max_tokens: maxTokens,
+      },
+      {
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${apiKey}`,
+        },
+        timeout: 30000,
+      }
+    );
 
-    if (!res.ok) {
-      throw new Error(`LLM call failed: ${res.status} ${await res.text()}`);
-    }
-
-    const data = await res.json();
-    const content = data.message?.content;
-
+    const content = response.data?.choices?.[0]?.message?.content;
     if (!content) {
-      throw new Error(`LLM returned empty content: ${JSON.stringify(data)}`);
+      throw new Error(`DeepSeek returned empty content: ${JSON.stringify(response.data)}`);
     }
 
     return content.trim();
   }
 
-  // ─── Embedding helper ────────────────────────────────────────────────────
+  // ─── Embedding helper (still uses Ollama) ───────────────────────────────
   private async getEmbedding(text: string, parentSpan?: any): Promise<number[]> {
     const span = startEmbeddingSpan('learningLoop.getEmbedding', parentSpan, {
       model: 'nomic-embed-text',
@@ -607,7 +596,7 @@ The SOP must:
 
 Return ONLY the SOP text. No preamble, no markdown fences.`;
 
-    return this.callLLM(prompt, 800, parentSpan);
+    return this.callLLM(prompt, 4000, parentSpan);
   }
 
   // ─── Generate new invariant via LLM ─────────────────────────────────────
@@ -637,7 +626,7 @@ The function must:
 
 Return ONLY the raw Python function. No markdown fences, no imports, no explanation.`;
 
-    return this.callLLM(prompt, 600, parentSpan);
+    return this.callLLM(prompt, 4000, parentSpan);
   }
 
   // ─── Intent name generation (moved from router) ──────────────────────────
