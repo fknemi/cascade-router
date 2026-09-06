@@ -8,6 +8,9 @@ export class AOSandbox {
   private traceId: string = "";
   private sandboxActive: boolean = false;
 
+  /**
+   * Initializes a new worktree on the AO server for the Student's execution.
+   */
   async create(intentId: string, traceId: string): Promise<void> {
     this.traceId = traceId;
     
@@ -40,6 +43,9 @@ export class AOSandbox {
     }
   }
 
+  /**
+   * Discards the worktree. Called when the Student fails Layer 2 Validation.
+   */
   async rollback(): Promise<void> {
     if (!this.worktreeId || !this.sandboxActive) return;
 
@@ -52,11 +58,15 @@ export class AOSandbox {
           trace_id: this.traceId,
         }),
       });
+      console.log(`[Sandbox] Worktree ${this.worktreeId} rolled back successfully.`);
     } catch (e) {
       console.log("[Sandbox] Rollback skipped (no AO server)");
     }
   }
 
+  /**
+   * Merges the worktree. Called when the Student passes Layer 2 Validation.
+   */
   async commit(): Promise<void> {
     if (!this.worktreeId || !this.sandboxActive) return;
 
@@ -69,11 +79,15 @@ export class AOSandbox {
           trace_id: this.traceId,
         }),
       });
+      console.log(`[Sandbox] Worktree ${this.worktreeId} committed successfully.`);
     } catch (e) {
       console.log("[Sandbox] Commit skipped (no AO server)");
     }
   }
 
+  /**
+   * Retrieves the current active worktree ID for routing DB queries.
+   */
   getWorktreeId(): string {
     return this.worktreeId;
   }

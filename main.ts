@@ -115,9 +115,8 @@ async function callDeepSeekRaw(
     messages,
     stream: false,
     temperature: options.temperature ?? 0.2,
-    max_tokens: 4096,
   };
-  
+
   if (options.tools && options.tools.length > 0) {
     body.tools = options.tools;
     if (options.tool_choice !== undefined) {
@@ -158,7 +157,7 @@ function extractJSON(text: string): any {
   try {
     return JSON.parse(text);
   } catch (e) {}
-  
+
   // 2. Try extracting from markdown code blocks (handles both {} and [])
   const jsonMatch = text.match(/```(?:json)?\s*([\s\S]*?)\s*```/);
   if (jsonMatch) {
@@ -166,7 +165,7 @@ function extractJSON(text: string): any {
       return JSON.parse(jsonMatch[1]);
     } catch (e2) {}
   }
-  
+
   // 3. Loose match: grab everything from the first { or [ to the last } or ]
   const looseMatch = text.match(/([\{\[][\s\S]*[\}\]])/);
   if (looseMatch) {
@@ -174,7 +173,7 @@ function extractJSON(text: string): any {
       return JSON.parse(looseMatch[0]);
     } catch (e3) {}
   }
-  
+
   return null;
 }
 
@@ -182,6 +181,7 @@ function extractJSON(text: string): any {
 let routeIntentFn: any = null;
 let layer1ValidateFn: any = null;
 let layer2ValidateFn: any = null;
+let AOSandboxClass: any = null;
 
 async function loadCascadeComponents() {
   if (!routeIntentFn) {
@@ -196,9 +196,26 @@ async function loadCascadeComponents() {
     const layer2Module = await import("./src/gate/layer2");
     layer2ValidateFn = layer2Module.layer2Validate;
   }
+  if (!AOSandboxClass) {
+    try {
+      const sandboxModule = await import("./src/sandbox/aoSandbox");
+      AOSandboxClass = sandboxModule.AOSandbox;
+    } catch (e) {
+      console.log(
+        "[Cascade] Warning: AOSandbox not found yet. Using safe mock fallback for now.",
+      );
+      AOSandboxClass = class MockSandbox {
+        getState() {
+          return {};
+        }
+        async commit() {}
+        async rollback() {}
+      };
+    }
+  }
 }
 
-// === CASCADE PIPELINE ===
+// === CASCADE PIPELINE (TENSORMUX PATTERN) ===
 async function cascadePipeline(
   userQuery: string,
   modelRequested: string,
@@ -229,7 +246,7 @@ async function cascadePipeline(
     "debug",
     "refactor",
   ];
-  
+
   const isCodeQuery = codeKeywords.some((kw) => queryLower.includes(kw));
   const isDomainIntent =
     intentName.includes("invoice") ||
@@ -245,7 +262,6 @@ async function cascadePipeline(
   }
 
   console.log(`[Cascade] Intent: ${intentName}`);
-
   const worktreeId = randomUUID();
   console.log(`[Cascade] Worktree: ${worktreeId}`);
 
@@ -259,74 +275,68 @@ async function cascadePipeline(
   const hasRealSchema =
     Object.keys(schemaProperties).length > 0 || schemaRequired.length > 0;
 
-  // Define the system context to inject into all prompts
   const systemContext = `\n\nCURRENT SYSTEM CONTEXT:\n- Current Date/Time: ${new Date().toISOString()}\n- Local Timezone: Asia/Kolkata (Indore, Madhya Pradesh, India)\n\nIMPORTANT: If the schema requires a date or timestamp, use the CURRENT SYSTEM CONTEXT above. DO NOT use example dates from the schema.`;
 
-  // Step 2: Student draft using DeepSeek Flash
-  console.log(`[Cascade] Student (${STUDENT_MODEL}) drafting...`);
-  const studentMessages = [
-    {
-      role: "system",
-      content:
-        "You are a task execution agent. Follow the SOP exactly. Output ONLY a valid JSON object matching the schema. No markdown, no arrays, no explanations." + systemContext,
-    },
-    {
-      role: "user",
-      content: `SOP Instructions:\n${bundle.execution_assets.sop_text}${schemaPrompt}\n\nUser Query:\n${userQuery}\n\nOutput the result as JSON:`,
-    },
-  ];
+  // Initialize Sandbox Environment
+  const sandbox = new AOSandboxClass();
 
-  const studentRaw = await callDeepSeek(STUDENT_MODEL, studentMessages, 0.2);
-  console.log(`[Cascade] Student raw: ${studentRaw.substring(0, 150)}...`);
-  const studentDraft = extractJSON(studentRaw);
-
-  // If Student produced invalid JSON → call Teacher
-  if (!studentDraft) {
-    console.log("[Cascade] Student produced invalid JSON → Teacher fallback");
-    console.log(`[Cascade] Teacher (${TEACHER_MODEL}) executing...`);
-    const teacherMessages = [
+  try {
+    // Step 2: Student draft (Speculative Execution)
+    console.log(`[Cascade] Student (${STUDENT_MODEL}) drafting...`);
+    const studentMessages = [
       {
         role: "system",
         content:
-          "You are a highly capable execution agent. Execute the task correctly. Output ONLY valid JSON matching the schema." + systemContext,
+          "You are a task execution agent. Follow the SOP exactly. Output ONLY a valid JSON object matching the schema. No markdown, no arrays, no explanations." +
+          systemContext,
       },
       {
         role: "user",
-        content: `SOP Instructions:\n${bundle.execution_assets.sop_text}${schemaPrompt}\n\nUser Query:\n${userQuery}\n\nExecute correctly and output JSON:`,
+        content: `SOP Instructions:\n${bundle.execution_assets.sop_text}${schemaPrompt}\n\nUser Query:\n${userQuery}\n\nOutput the result as JSON:`,
       },
     ];
-    const teacherRaw = await callDeepSeek(TEACHER_MODEL, teacherMessages, 0.1);
-    const teacherDraft = extractJSON(teacherRaw);
-    return {
-      trace_id: traceId,
-      path: "teacher_fallback",
-      status: "completed",
-      draft: teacherDraft,
-      intent: bundle.routing_metadata.intent_name,
-    };
-  }
 
-  // Step 3: Gate validation
-  const layer1 = layer1ValidateFn(
-    studentDraft,
-    bundle.verification_assets.layer1_schema,
-  );
-  const layer2 = await layer2ValidateFn(
-    studentDraft,
-    bundle.verification_assets.layer2_invariant_code,
-    {},
-  );
+    const studentRaw = await callDeepSeek(STUDENT_MODEL, studentMessages, 0.2);
+    console.log(`[Cascade] Student raw: ${studentRaw.substring(0, 150)}...`);
 
-  console.log(`[Cascade] Layer 1: ${layer1.passed ? "PASS" : "FAIL"}`);
-  console.log(`[Cascade] Layer 2: ${layer2.passed ? "PASS" : "FAIL"}`);
-  if (!hasRealSchema) {
-    console.log(
-      `[Cascade]  "${intentName}" has no real layer1 schema (empty properties/required) — a layer1 pass here didn't check anything`,
+    const studentDraft = extractJSON(studentRaw);
+    if (!studentDraft) {
+      throw new Error("Student failed to produce parseable JSON");
+    }
+
+    // Step 3: Layer 1 Gate Validation (Structural)
+    const layer1 = await layer1ValidateFn(
+      studentDraft,
+      bundle.verification_assets.layer1_schema,
     );
-  }
+    if (!layer1.passed) {
+      throw new Error(`Layer 1 Structural Check Failed: ${layer1.output}`);
+    }
 
-  if (layer1.passed && layer2.passed) {
-    console.log(`[Cascade]  FAST PATH - Student passed!${hasRealSchema ? "" : " (unverified: no real schema)"}`);
+    if (!hasRealSchema) {
+      console.log(
+        `[Cascade] "${intentName}" has no real layer1 schema — unverified structural pass.`,
+      );
+    }
+
+    // Step 4: Layer 2 Gate Validation (Semantic Invariant)
+    const dbState = sandbox.getState ? sandbox.getState() : {};
+    const layer2 = await layer2ValidateFn(
+      studentDraft,
+      bundle.verification_assets.layer2_invariant_code,
+      dbState,
+    );
+
+    if (!layer2.passed) {
+      throw new Error(`Layer 2 Invariant Check Failed: ${layer2.output}`);
+    }
+
+    // --- FAST PATH (SUCCESS) ---
+    console.log(`[Cascade] FAST PATH - Student passed all gates!`);
+
+    // Commit sandbox state (Item 23)
+    if (typeof sandbox.commit === "function") await sandbox.commit();
+
     return {
       trace_id: traceId,
       path: "student_fast_path",
@@ -335,30 +345,42 @@ async function cascadePipeline(
       intent: bundle.routing_metadata.intent_name,
       gated: hasRealSchema,
     };
-  }
+  } catch (gateError: any) {
+    // --- FALLBACK PATH (FAILURE) ---
+    console.log(`\n[Cascade] GATE TRIGGERED: ${gateError.message}`);
+    console.log(
+      `[Cascade] Rolling back sandbox and routing to Teacher (${TEACHER_MODEL})...`,
+    );
 
-  // Step 4: Teacher fallback for gate failure
-  console.log(`[Cascade]  Student failed gates → Teacher (${TEACHER_MODEL})`);
-  const teacherMessages = [
-    {
-      role: "system",
-      content:
-        "You are a highly capable execution agent. Execute the task correctly. Output ONLY valid JSON matching the schema." + systemContext,
-    },
-    {
-      role: "user",
-      content: `SOP Instructions:\n${bundle.execution_assets.sop_text}${schemaPrompt}\n\nUser Query:\n${userQuery}\n\nExecute correctly and output JSON:`,
-    },
-  ];
-  const teacherRaw = await callDeepSeek(TEACHER_MODEL, teacherMessages, 0.1);
-  const teacherDraft = extractJSON(teacherRaw);
-  return {
-    trace_id: traceId,
-    path: "teacher_fallback",
-    status: "completed",
-    draft: teacherDraft,
-    intent: bundle.routing_metadata.intent_name,
-  };
+    // Rollback sandbox state (Items 24 & 35)
+    if (typeof sandbox.rollback === "function") await sandbox.rollback();
+
+    // Step 5: Execute Teacher Model
+    const teacherMessages = [
+      {
+        role: "system",
+        content:
+          "You are a highly capable execution agent. Execute the task correctly. Output ONLY valid JSON matching the schema." +
+          systemContext,
+      },
+      {
+        role: "user",
+        content: `SOP Instructions:\n${bundle.execution_assets.sop_text}${schemaPrompt}\n\nUser Query:\n${userQuery}\n\nExecute correctly and output JSON:`,
+      },
+    ];
+
+    const teacherRaw = await callDeepSeek(TEACHER_MODEL, teacherMessages, 0.1);
+    const teacherDraft = extractJSON(teacherRaw);
+
+    return {
+      trace_id: traceId,
+      path: "teacher_fallback",
+      status: "completed",
+      draft: teacherDraft,
+      intent: bundle.routing_metadata.intent_name,
+      error_caught: gateError.message,
+    };
+  }
 }
 
 // Request logging
@@ -381,9 +403,19 @@ function sendChatResponse(
     cascadeMetadata: any;
   },
 ) {
-  const { traceId, modelUsed, content, toolCalls, finishReason, isStreaming, cascadeMetadata } = args;
+  const {
+    traceId,
+    modelUsed,
+    content,
+    toolCalls,
+    finishReason,
+    isStreaming,
+    cascadeMetadata,
+  } = args;
   const hasToolCalls = !!toolCalls && toolCalls.length > 0;
-  const effectiveFinishReason = hasToolCalls ? "tool_calls" : finishReason || "stop";
+  const effectiveFinishReason = hasToolCalls
+    ? "tool_calls"
+    : finishReason || "stop";
 
   if (hasToolCalls) {
     console.log(
@@ -418,7 +450,9 @@ function sendChatResponse(
         object: "chat.completion.chunk",
         created: Math.floor(Date.now() / 1000),
         model: modelUsed,
-        choices: [{ index: 0, delta: {}, finish_reason: effectiveFinishReason }],
+        choices: [
+          { index: 0, delta: {}, finish_reason: effectiveFinishReason },
+        ],
       })}\n\n`,
     );
     res.write("data: [DONE]\n\n");
@@ -426,7 +460,10 @@ function sendChatResponse(
     return;
   }
 
-  const message: any = { role: "assistant", content: hasToolCalls ? null : content };
+  const message: any = {
+    role: "assistant",
+    content: hasToolCalls ? null : content,
+  };
   if (hasToolCalls) {
     message.tool_calls = toolCalls;
   }
@@ -454,7 +491,7 @@ app.post("/v1/chat/completions", async (req, res) => {
     const userMessages = messages.filter((m: any) => m.role === "user");
     const lastUserMessage = userMessages[userMessages.length - 1];
     let userQuery = "";
-    
+
     if (lastUserMessage?.content) {
       if (typeof lastUserMessage.content === "string") {
         userQuery = lastUserMessage.content;
@@ -481,13 +518,16 @@ app.post("/v1/chat/completions", async (req, res) => {
       cascadeResult.path === "mismatch" ||
       cascadeResult.path === "forward_to_backend"
     ) {
-      console.log("[Router] Forwarding to DeepSeek directly (preserving tools)");
-      
+      console.log(
+        "[Router] Forwarding to DeepSeek directly (preserving tools)",
+      );
+
       const result = await callDeepSeekRaw(STUDENT_MODEL, messages, {
-        tools: incomingTools && incomingTools.length > 0 ? incomingTools : undefined,
+        tools:
+          incomingTools && incomingTools.length > 0 ? incomingTools : undefined,
         tool_choice: incomingToolChoice,
       });
-      
+
       return sendChatResponse(res, {
         traceId: cascadeResult.trace_id || randomUUID(),
         modelUsed: "deepseek-direct",

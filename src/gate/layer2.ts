@@ -3,151 +3,174 @@
 
 import { exec } from "child_process";
 import { promisify } from "util";
+import * as fs from "fs";
+import * as os from "os";
+import * as path from "path";
 
 const execAsync = promisify(exec);
 
-// Clean invariant code (remove markdown, extract function)
+// Clean invariant code (remove markdown fences, extract function)
 function cleanInvariantCode(code: string): string {
-  let cleaned = code;
-  
-  // Remove markdown code blocks
+  let cleaned = code.trim();
+
+  // Remove markdown code blocks (python or generic)
   cleaned = cleaned.replace(/```python\s*/g, '');
   cleaned = cleaned.replace(/```\s*/g, '');
-  
-  // Remove leading/trailing whitespace
-  cleaned = cleaned.trim();
-  
-  return cleaned;
+
+  return cleaned.trim();
 }
 
-// Extract just the verify_logic function if full code is provided
+// Ensure the code contains a `verify_logic` function.
+// If only assert statements are provided, wrap them.
 function extractVerifyLogic(code: string): string {
-  // If it already has verify_logic, return as-is
-  if (code.includes('def verify_logic')) {
+  // If already has the function, return as-is
+  if (/\bdef\s+verify_logic\b/.test(code)) {
     return code;
   }
-  
-  // If it's just assert statements, wrap them
-  return `def verify_logic(payload, state):\n${code.split('\n').map(l => '    ' + l).join('\n')}`;
+
+  // Otherwise wrap the raw statements into a function
+  const indented = code
+    .split('\n')
+    .map(line => '    ' + line)
+    .join('\n');
+  return `def verify_logic(payload, state):\n${indented}`;
+}
+
+// Build a Python script that loads the invariant code and runs it
+function buildPythonScript(finalCode: string, draft: any, state: any): string {
+  const payloadJson = JSON.stringify(draft);
+  const stateJson = JSON.stringify(state);
+
+  // Escape single quotes for Python single‑quoted strings
+  const escapedPayload = payloadJson.replace(/'/g, "\\'");
+  const escapedState = stateJson.replace(/'/g, "\\'");
+
+  return `import json
+
+${finalCode}
+
+# Auto-invoke verify_logic with the provided payload and state
+try:
+    payload = json.loads('${escapedPayload}')
+    state = json.loads('${escapedState}')
+    verify_logic(payload, state)
+    print("PASS")
+except AssertionError as e:
+    print(f"FAIL: {e}")
+except Exception as e:
+    print(f"ERROR: {type(e).__name__}: {e}")
+`;
 }
 
 export async function layer2Validate(
   draft: any,
   invariantCode: string,
   state: any = {}
-): Promise<{ passed: boolean; output: string }> {
+): Promise<{ passed: boolean; output: string; execution_ms?: number }> {
   if (!invariantCode || invariantCode.trim() === '') {
     console.log("[Layer 2] No invariant code - skipping");
-    return { passed: true, output: "skipped" };
+    return { passed: true, output: "skipped", execution_ms: 0 };
   }
-  
-  // Clean and prepare the code
+
+  // Clean and prepare the invariant code
   const cleanCode = cleanInvariantCode(invariantCode);
   const finalCode = extractVerifyLogic(cleanCode);
-  
+
   console.log("[Layer 2] Invariant code preview:");
-  console.log(finalCode.substring(0, 200) + "...");
-  
-  // Prepare payload and state as JSON strings
-  const payloadJson = JSON.stringify(draft);
-  const stateJson = JSON.stringify(state);
-  
-  // Build the Python script
-  const script = `import json
+  console.log(finalCode.substring(0, 300) + (finalCode.length > 300 ? "..." : ""));
 
-${finalCode}
+  // Build the script
+  const script = buildPythonScript(finalCode, draft, state);
 
-# Auto-invoke verify_logic
-try:
-    verify_logic(json.loads('${payloadJson.replace(/'/g, "\\'")}'), json.loads('${stateJson.replace(/'/g, "\\'")}'))
-    print("PASS")
-except AssertionError as e:
-    print(f"FAIL: {e}")
-except Exception as e:
-    print(f"ERROR: {e}")
-`;
-  
-  // Write script to temp file for easier debugging
-  const fs = require('fs');
-  const tmpFile = '/tmp/cascade_invariant_test.py';
+  // Write to a temporary file (easier to debug, avoids shell escaping issues)
+  const tmpFile = path.join(os.tmpdir(), `cascade_inv_${Date.now()}.py`);
   fs.writeFileSync(tmpFile, script);
-  
+
+  const startTime = Date.now();
+
   try {
-    const { stdout, stderr } = await execAsync(`python3 ${tmpFile}`, { 
-      timeout: 5000,
-      maxBuffer: 1024 * 1024,
+    const { stdout, stderr } = await execAsync(`python3 ${tmpFile}`, {
+      timeout: 5000, // 5 seconds
+      maxBuffer: 1024 * 1024, // 1 MB
     });
-    
+
+    const executionMs = Date.now() - startTime;
     const output = stdout.trim();
     const passed = output.includes("PASS") && !output.includes("FAIL") && !output.includes("ERROR");
-    
-    console.log(`[Layer 2] ${passed ? ' PASSED' : ' FAILED'}`);
+
+    console.log(`[Layer 2] ${passed ? '✅ PASSED' : '❌ FAILED'} (${executionMs}ms)`);
     if (!passed) {
       console.log(`[Layer 2] Output: ${output}`);
       if (stderr) console.log(`[Layer 2] Stderr: ${stderr}`);
     }
-    
-    return { passed, output };
+
+    return { passed, output, execution_ms: executionMs };
   } catch (error: any) {
-    const output = error.stdout || error.message;
-    console.log(`[Layer 2]  FAILED (execution error)`);
+    const executionMs = Date.now() - startTime;
+    const output = error.stdout?.trim() || error.message;
+    console.log(`[Layer 2] ❌ FAILED (execution error) (${executionMs}ms)`);
     console.log(`[Layer 2] Output: ${output}`);
-    
-    return { passed: false, output };
+
+    return { passed: false, output, execution_ms: executionMs };
+  } finally {
+    // Clean up temp file
+    try {
+      fs.unlinkSync(tmpFile);
+    } catch (e) {
+      // ignore cleanup errors
+    }
   }
 }
 
-// Alternative: Use a sandboxed Python execution with resource limits
+// Sandboxed variant with resource limits (CPU, memory)
 export async function layer2ValidateSandboxed(
   draft: any,
   invariantCode: string,
   state: any = {}
-): Promise<{ passed: boolean; output: string }> {
+): Promise<{ passed: boolean; output: string; execution_ms?: number }> {
   const cleanCode = cleanInvariantCode(invariantCode);
   const finalCode = extractVerifyLogic(cleanCode);
-  
-  const payloadJson = JSON.stringify(draft);
-  const stateJson = JSON.stringify(state);
-  
-  const script = `import json
+  const script = buildPythonScript(finalCode, draft, state);
 
-${finalCode}
+  const tmpFile = path.join(os.tmpdir(), `cascade_inv_sandbox_${Date.now()}.py`);
+  fs.writeFileSync(tmpFile, script);
 
-try:
-    verify_logic(json.loads('${payloadJson.replace(/'/g, "\\'")}'), json.loads('${stateJson.replace(/'/g, "\\'")}'))
-    print("PASS")
-except AssertionError as e:
-    print(f"FAIL: {e}")
-except Exception as e:
-    print(f"ERROR: {e}")
-`;
-  
-  // Use resource limits for security
+  // Use resource limits via a Python wrapper
   const sandboxCmd = `python3 -c "
 import resource
-import os
 import sys
+import os
 
 # Set resource limits
-resource.setrlimit(resource.RLIMIT_CPU, (1, 1))  # 1 second CPU
-resource.setrlimit(resource.RLIMIT_AS, (100 * 1024 * 1024, 100 * 1024 * 1024))  # 100MB memory
+resource.setrlimit(resource.RLIMIT_CPU, (1, 1))      # 1 second CPU
+resource.setrlimit(resource.RLIMIT_AS, (100*1024*1024, 100*1024*1024))  # 100 MB memory
 
-exec(open('${tmpFile}').read())
+try:
+    exec(open('${tmpFile}').read())
+except Exception as e:
+    print(f'ERROR: {e}')
 "`;
-  
-  // Write script to temp file
-  const fs = require('fs');
-  const tmpFile = '/tmp/cascade_invariant_sandboxed.py';
-  fs.writeFileSync(tmpFile, script);
-  
+
+  const startTime = Date.now();
   try {
-    const { stdout } = await execAsync(sandboxCmd, { timeout: 3000 });
+    const { stdout, stderr } = await execAsync(sandboxCmd, {
+      timeout: 3000, // 3 seconds wall time
+      maxBuffer: 1024 * 1024,
+    });
+
+    const executionMs = Date.now() - startTime;
     const output = stdout.trim();
-    const passed = output.includes("PASS");
-    
-    console.log(`[Layer 2 Sandboxed] ${passed ? ' PASSED' : ' FAILED'}`);
-    return { passed, output };
+    const passed = output.includes("PASS") && !output.includes("FAIL") && !output.includes("ERROR");
+
+    console.log(`[Layer 2 Sandboxed] ${passed ? '✅ PASSED' : '❌ FAILED'} (${executionMs}ms)`);
+    return { passed, output, execution_ms: executionMs };
   } catch (error: any) {
-    return { passed: false, output: error.stdout || error.message };
+    const executionMs = Date.now() - startTime;
+    const output = error.stdout?.trim() || error.message;
+    return { passed: false, output, execution_ms: executionMs };
+  } finally {
+    try {
+      fs.unlinkSync(tmpFile);
+    } catch (e) {}
   }
 }

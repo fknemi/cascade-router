@@ -17,7 +17,7 @@ const OLLAMA_EMBED_URL = "http://localhost:11434/api/embed";
 // ceilings despite the old names; only MAX_DISTANCE used to actually block
 // a match. Renamed for clarity and a margin check has been added below.
 const WARN_DISTANCE = 0.65;  // Above this, log a warning even if still accepted
-const MAX_DISTANCE = 0.45;   // Reject: absolute "no confident match" cutoff.
+const MAX_DISTANCE = 0.35;   // Reject: absolute "no confident match" cutoff. (Updated from 0.45)
 // Tuned against real traces: "write api docs" landed its best match around
 // 0.50-0.55 across a near three-way tie and should be rejected. Retune
 // against a larger labeled sample once available.
@@ -49,9 +49,6 @@ async function getEmbedding(text: string): Promise<number[]> {
   const data = await res.json();
   return data.embeddings[0];
 }
-
-
-
 
 
 export async function routeIntent(
@@ -95,8 +92,6 @@ export async function routeIntent(
 
     // Reject: top match isn't meaningfully better than the runner-up, i.e.
     // the embedding didn't actually discriminate between candidate intents.
-    // This check did not exist before — a low top-1 distance alone isn't
-    // sufficient evidence if two or three intents are all clustered together.
     if (runnerUp && (runnerUp.distance - match.distance) < MIN_MARGIN) {
       console.log(
         `[Router]  Top match "${match.name}" (${match.distance.toFixed(4)}) too close to runner-up ` +
