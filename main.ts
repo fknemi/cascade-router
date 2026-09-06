@@ -1,10 +1,11 @@
 // main.ts - Cascade v3 Router with DeepSeek Student/Teacher
 import express from "express";
 import axios from "axios";
-import { readFileSync, existsSync } from "fs";
+import { readFileSync, existsSync, readdirSync } from "fs";
 import { join } from "path";
 import { homedir } from "os";
 import { randomUUID } from "crypto";
+import { Database } from "bun:sqlite";
 
 const app = express();
 app.use(express.json({ limit: "50mb" }));
@@ -52,6 +53,196 @@ const DEEPSEEK_API_KEY =
 const STUDENT_MODEL = "deepseek-v4-flash";
 const TEACHER_MODEL = "deepseek-v4-pro";
 
+// === AO SQLITE DATABASE ===
+const AO_DB_PATH = join(homedir(), ".ao", "data", "ao.db");
+const AO_WORKTREES_PATH = join(homedir(), ".ao", "data", "worktrees");
+
+// In-memory session cache
+const aoSessionCache = new Map<string, any>();
+let aoDb: Database | null = null;
+
+function getAODatabase(): Database | null {
+  if (aoDb) return aoDb;
+  
+  if (!existsSync(AO_DB_PATH)) {
+    console.error(`[AO] Database not found at: ${AO_DB_PATH}`);
+    return null;
+  }
+  
+  try {
+    aoDb = new Database(AO_DB_PATH, { readonly: true });
+    return aoDb;
+  } catch (e: any) {
+    console.error(`[AO] Failed to open database: ${e.message}`);
+    aoDb = null;
+    return null;
+  }
+}
+
+// Get worktrees with session info using correct schema
+function getWorktreesFromDB(): any[] {
+  const db = getAODatabase();
+  if (!db) return [];
+  
+  try {
+    // Correct query based on actual schema
+    const worktrees = db.query(`
+      SELECT 
+        sw.session_id,
+        sw.repo_name,
+        sw.branch,
+        sw.base_sha,
+        sw.worktree_path,
+        sw.state,
+        sw.base_ref,
+        s.id as session_id_full,
+        s.project_id,
+        s.num,
+        s.kind,
+        s.activity_state,
+        s.is_terminated,
+        s.display_name,
+        s.prompt,
+        s.latest_user_prompt,
+        s.workspace_path,
+        s.created_at as session_created_at,
+        s.updated_at as session_updated_at
+      FROM session_worktrees sw
+      INNER JOIN sessions s ON sw.session_id = s.id
+      WHERE sw.state = 'active'
+        AND s.is_terminated = FALSE
+      ORDER BY s.updated_at DESC
+    `).all();
+    
+    return worktrees;
+  } catch (e: any) {
+    console.error(`[AO] Failed to query worktrees: ${e.message}`);
+    return [];
+  }
+}
+
+// Find existing worktree for a task
+function findExistingWorktree(taskSignature: string, userQuery: string): any | null {
+  // Check cache first
+  const cached = aoSessionCache.get(taskSignature);
+  if (cached) {
+    console.log(`[AO] ✅ Found cached worktree for ${taskSignature}`);
+    return cached;
+  }
+  
+  // Check database
+  const worktrees = getWorktreesFromDB();
+  
+  if (worktrees.length > 0) {
+    console.log(`[AO] Checking ${worktrees.length} active worktrees for "${taskSignature}"`);
+    
+    // Extract invoice number from signature
+    const invoiceNum = taskSignature.replace('invoice-', '');
+    
+    // Look for matching worktree
+    const matchingWorktree = worktrees.find((wt: any) => {
+      // Check if the session prompt or display name contains the invoice number
+      const prompt = (wt.prompt || '').toLowerCase();
+      const displayName = (wt.display_name || '').toLowerCase();
+      const latestPrompt = (wt.latest_user_prompt || '').toLowerCase();
+      const branch = (wt.branch || '').toLowerCase();
+      const worktreePath = (wt.worktree_path || '').toLowerCase();
+      
+      // Check for invoice number in various fields
+      return (
+        prompt.includes(invoiceNum) ||
+        displayName.includes(invoiceNum) ||
+        latestPrompt.includes(invoiceNum) ||
+        branch.includes(invoiceNum) ||
+        worktreePath.includes(invoiceNum) ||
+        prompt.includes('reconcile') && prompt.includes(invoiceNum)
+      );
+    });
+    
+    if (matchingWorktree) {
+      console.log(`[AO] ✅ Found matching worktree for invoice #${invoiceNum}`);
+      console.log(`[AO] Session: ${matchingWorktree.display_name || matchingWorktree.session_id}`);
+      console.log(`[AO] Worktree: ${matchingWorktree.worktree_path}`);
+      aoSessionCache.set(taskSignature, matchingWorktree);
+      return matchingWorktree;
+    }
+  }
+  
+  // Check filesystem as fallback
+  try {
+    if (existsSync(AO_WORKTREES_PATH)) {
+      const projects = readdirSync(AO_WORKTREES_PATH);
+      const invoiceNum = taskSignature.replace('invoice-', '');
+      
+      for (const project of projects) {
+        const projectPath = join(AO_WORKTREES_PATH, project);
+        if (existsSync(projectPath)) {
+          const worktrees = readdirSync(projectPath);
+          
+          for (const worktree of worktrees) {
+            if (worktree.includes(invoiceNum) || worktree.toLowerCase().includes(invoiceNum)) {
+              const session: any = {
+                session_id: worktree,
+                worktree_path: join(projectPath, worktree),
+                branch: worktree,
+                state: 'active',
+                project_name: project,
+              };
+              console.log(`[AO] ✅ Found worktree on filesystem: ${worktree}`);
+              aoSessionCache.set(taskSignature, session);
+              return session;
+            }
+          }
+        }
+      }
+    }
+  } catch (e) {
+    // Ignore filesystem errors
+  }
+  
+  console.log(`[AO] No existing worktree found for "${taskSignature}"`);
+  return null;
+}
+
+// Generate task signature from query
+function generateTaskSignature(query: string): string {
+  const normalized = query.toLowerCase().trim();
+  
+  // Extract key identifiers
+  const invoiceMatch = normalized.match(/invoice\s*#?(\d+)/i);
+  const poMatch = normalized.match(/po\s*#?(\d+)/i);
+  const ticketMatch = normalized.match(/ticket\s*#?(\d+)/i);
+  
+  if (invoiceMatch) return `invoice-${invoiceMatch[1]}`;
+  if (poMatch) return `po-${poMatch[1]}`;
+  if (ticketMatch) return `ticket-${ticketMatch[1]}`;
+  
+  // Fallback: use key terms
+  const words = normalized
+    .split(/\s+/)
+    .filter(word => word.length > 3 && !['please', 'reconcile', 'the', 'amount', 'with'].includes(word))
+    .slice(0, 3)
+    .join('-');
+  
+  return words || `task-${randomUUID().substring(0, 8)}`;
+}
+
+// === AO INTERNAL MESSAGE PREFIXES ===
+const AO_INTERNAL_PREFIXES = [
+  "AO TASK TITLE UPDATE",
+  "AO TASK COMPLETE",
+  "AO TASK FAILED",
+  "AO WORKER SPAWNED",
+  "AO WORKER COMPLETE",
+  "AO SYSTEM",
+  "A worker was already spawned",
+];
+
+function isAOInternalMessage(query: string): boolean {
+  const trimmed = query.trimStart();
+  return AO_INTERNAL_PREFIXES.some((prefix) => trimmed.startsWith(prefix));
+}
+
 // === RESOLVE BACKEND ===
 function resolveBackend(modelString: string): {
   baseURL: string;
@@ -72,7 +263,6 @@ function resolveBackend(modelString: string): {
     }
   }
 
-  // Default: deepseek
   return {
     baseURL: DEEPSEEK_URL,
     apiKey: DEEPSEEK_API_KEY,
@@ -153,12 +343,10 @@ async function callDeepSeek(
 
 // === EXTRACT JSON ===
 function extractJSON(text: string): any {
-  // 1. Try parsing raw text directly
   try {
     return JSON.parse(text);
   } catch (e) {}
 
-  // 2. Try extracting from markdown code blocks (handles both {} and [])
   const jsonMatch = text.match(/```(?:json)?\s*([\s\S]*?)\s*```/);
   if (jsonMatch) {
     try {
@@ -166,7 +354,6 @@ function extractJSON(text: string): any {
     } catch (e2) {}
   }
 
-  // 3. Loose match: grab everything from the first { or [ to the last } or ]
   const looseMatch = text.match(/([\{\[][\s\S]*[\}\]])/);
   if (looseMatch) {
     try {
@@ -181,7 +368,7 @@ function extractJSON(text: string): any {
 let routeIntentFn: any = null;
 let layer1ValidateFn: any = null;
 let layer2ValidateFn: any = null;
-let AOSandboxClass: any = null;
+let CompositeSandboxClass: any = null;
 
 async function loadCascadeComponents() {
   if (!routeIntentFn) {
@@ -196,18 +383,15 @@ async function loadCascadeComponents() {
     const layer2Module = await import("./src/gate/layer2");
     layer2ValidateFn = layer2Module.layer2Validate;
   }
-  if (!AOSandboxClass) {
+  if (!CompositeSandboxClass) {
     try {
-      const sandboxModule = await import("./src/sandbox/aoSandbox");
-      AOSandboxClass = sandboxModule.AOSandbox;
+      const sandboxModule = await import("./src/sandbox/index");
+      CompositeSandboxClass = sandboxModule.CompositeSandbox;
     } catch (e) {
-      console.log(
-        "[Cascade] Warning: AOSandbox not found yet. Using safe mock fallback for now.",
-      );
-      AOSandboxClass = class MockSandbox {
-        getState() {
-          return {};
-        }
+      console.log("[Cascade] Warning: CompositeSandbox not found, using mock");
+      CompositeSandboxClass = class MockSandbox {
+        getState() { return {}; }
+        async create() {}
         async commit() {}
         async rollback() {}
       };
@@ -262,8 +446,32 @@ async function cascadePipeline(
   }
 
   console.log(`[Cascade] Intent: ${intentName}`);
-  const worktreeId = randomUUID();
-  console.log(`[Cascade] Worktree: ${worktreeId}`);
+
+  // === CHECK FOR EXISTING WORKTREE ===
+  const taskSignature = generateTaskSignature(userQuery);
+  const existingWorktree = findExistingWorktree(taskSignature, userQuery);
+  
+  let worktreeId: string;
+  let worktreeReused = false;
+  let worktreePath: string | null = null;
+  let sessionInfo: any = null;
+
+  if (existingWorktree) {
+    worktreeId = existingWorktree.session_id || existingWorktree.id;
+    worktreePath = existingWorktree.worktree_path;
+    sessionInfo = existingWorktree;
+    worktreeReused = true;
+    console.log(`[Cascade] ✅ Reusing existing AO worktree`);
+    console.log(`[Cascade] Session ID: ${worktreeId}`);
+    console.log(`[Cascade] Worktree path: ${worktreePath}`);
+    if (existingWorktree.display_name) {
+      console.log(`[Cascade] Display name: ${existingWorktree.display_name}`);
+    }
+  } else {
+    worktreeId = randomUUID();
+    console.log(`[Cascade] No existing worktree for "${taskSignature}"`);
+    console.log(`[Cascade] AO will manage worktree creation for this session`);
+  }
 
   const schema = bundle.verification_assets.layer1_schema;
   const schemaPrompt = schema
@@ -275,10 +483,13 @@ async function cascadePipeline(
   const hasRealSchema =
     Object.keys(schemaProperties).length > 0 || schemaRequired.length > 0;
 
-  const systemContext = `\n\nCURRENT SYSTEM CONTEXT:\n- Current Date/Time: ${new Date().toISOString()}\n- Local Timezone: Asia/Kolkata (Indore, Madhya Pradesh, India)\n\nIMPORTANT: If the schema requires a date or timestamp, use the CURRENT SYSTEM CONTEXT above. DO NOT use example dates from the schema.`;
+  const systemContext = `\n\nCURRENT SYSTEM CONTEXT:\n- Current Date/Time: ${new Date().toISOString()}\n- Local Timezone: Asia/Kolkata (Indore, Madhya Pradesh, India)\n${worktreePath ? `- AO Worktree: ${worktreePath}` : ''}\n\nIMPORTANT: If the schema requires a date or timestamp, use the CURRENT SYSTEM CONTEXT above. DO NOT use example dates from the schema.`;
 
-  // Initialize Sandbox Environment
-  const sandbox = new AOSandboxClass();
+  // Use in-memory sandbox only - AO manages worktrees
+  const sandbox = new CompositeSandboxClass();
+  sandbox.worktreeId = worktreeId;
+  sandbox.traceId = traceId;
+  sandbox.isAOHandled = true;
 
   try {
     // Step 2: Student draft (Speculative Execution)
@@ -333,9 +544,7 @@ async function cascadePipeline(
 
     // --- FAST PATH (SUCCESS) ---
     console.log(`[Cascade] FAST PATH - Student passed all gates!`);
-
-    // Commit sandbox state (Item 23)
-    if (typeof sandbox.commit === "function") await sandbox.commit();
+    console.log(`[Cascade] ✅ No local worktree operations needed (AO manages it)`);
 
     return {
       trace_id: traceId,
@@ -344,16 +553,19 @@ async function cascadePipeline(
       draft: studentDraft,
       intent: bundle.routing_metadata.intent_name,
       gated: hasRealSchema,
+      worktree_id: worktreeId,
+      worktree_reused: worktreeReused,
+      worktree_path: worktreePath,
+      task_signature: taskSignature,
+      session_id: existingWorktree?.session_id || null,
+      display_name: existingWorktree?.display_name || null,
     };
   } catch (gateError: any) {
     // --- FALLBACK PATH (FAILURE) ---
     console.log(`\n[Cascade] GATE TRIGGERED: ${gateError.message}`);
     console.log(
-      `[Cascade] Rolling back sandbox and routing to Teacher (${TEACHER_MODEL})...`,
+      `[Cascade] Routing to Teacher (${TEACHER_MODEL})...`,
     );
-
-    // Rollback sandbox state (Items 24 & 35)
-    if (typeof sandbox.rollback === "function") await sandbox.rollback();
 
     // Step 5: Execute Teacher Model
     const teacherMessages = [
@@ -379,6 +591,12 @@ async function cascadePipeline(
       draft: teacherDraft,
       intent: bundle.routing_metadata.intent_name,
       error_caught: gateError.message,
+      worktree_id: worktreeId,
+      worktree_reused: worktreeReused,
+      worktree_path: worktreePath,
+      task_signature: taskSignature,
+      session_id: existingWorktree?.session_id || null,
+      display_name: existingWorktree?.display_name || null,
     };
   }
 }
@@ -505,6 +723,24 @@ app.post("/v1/chat/completions", async (req, res) => {
     if (!userQuery) userQuery = "No query";
 
     console.log(`[Router] Query: "${userQuery.substring(0, 100)}..."`);
+
+    // === AO INTERNAL BYPASS ===
+    if (isAOInternalMessage(userQuery)) {
+      console.log("[Router] AO internal message — bypassing Cascade, forwarding direct");
+      const result = await callDeepSeekRaw(STUDENT_MODEL, messages, {
+        tools: incomingTools && incomingTools.length > 0 ? incomingTools : undefined,
+        tool_choice: incomingToolChoice,
+      });
+      return sendChatResponse(res, {
+        traceId: randomUUID(),
+        modelUsed: "deepseek-direct",
+        content: result.content,
+        toolCalls: result.toolCalls,
+        finishReason: result.finishReason,
+        isStreaming,
+        cascadeMetadata: { path: "ao_internal_bypass" },
+      });
+    }
 
     // Check if this query should use Cascade
     const cascadeResult = await cascadePipeline(userQuery, modelRequested);
@@ -633,12 +869,35 @@ app.post("/v1/chat/completions", async (req, res) => {
   }
 });
 
+// === DEBUG ENDPOINTS ===
 app.get("/health", (req, res) => {
   res.json({
     status: "ok",
     mode: "cascade",
     student: STUDENT_MODEL,
     teacher: TEACHER_MODEL,
+    ao_database: AO_DB_PATH,
+    ao_database_exists: existsSync(AO_DB_PATH),
+    worktrees_path: AO_WORKTREES_PATH,
+    worktrees_path_exists: existsSync(AO_WORKTREES_PATH),
+    cached_sessions: aoSessionCache.size,
+  });
+});
+
+app.get("/ao/worktrees", (req, res) => {
+  const worktrees = getWorktreesFromDB();
+  res.json({
+    count: worktrees.length,
+    worktrees: worktrees.map(wt => ({
+      session_id: wt.session_id,
+      display_name: wt.display_name,
+      worktree_path: wt.worktree_path,
+      branch: wt.branch,
+      state: wt.state,
+      activity_state: wt.activity_state,
+      prompt_preview: wt.prompt?.substring(0, 100),
+      latest_prompt_preview: wt.latest_user_prompt?.substring(0, 100),
+    })),
   });
 });
 
@@ -648,5 +907,7 @@ app.listen(PORT, () => {
   console.log(`Cascade v3 Router on http://localhost:${PORT}`);
   console.log(`Student: ${STUDENT_MODEL} (DeepSeek Flash)`);
   console.log(`Teacher: ${TEACHER_MODEL} (DeepSeek Pro)`);
+  console.log(`AO Database: ${AO_DB_PATH}`);
+  console.log(`AO Worktrees: ${AO_WORKTREES_PATH}`);
   console.log(`========================================\n`);
 });
