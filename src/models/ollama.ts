@@ -14,7 +14,12 @@ ${sopText}
 User Query:
 ${prompt}
 
-Generate the output as a valid JSON object:`;
+Generate the output as a valid JSON object:
+
+CURRENT CONTEXT:
+- Current Date/Time: ${new Date().toISOString()}
+- Local Timezone: Asia/Kolkata
+`;
 
   const response = await fetch(OLLAMA_URL, {
     method: "POST",
