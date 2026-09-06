@@ -29,6 +29,13 @@ const PERFORMANCE_TARGETS = {
   fallbackCostUsd: 0.12,
 };
 
+// FIX: Hard cap on consecutive tool-call rounds per conversation. Once the
+// incoming message history shows this many prior assistant tool_calls turns,
+// we stop offering tools entirely and force a final text answer. This is the
+// backstop that was completely missing before — nothing in the original file
+// could ever terminate the tool-call cycle on its own.
+const MAX_TOOL_ROUNDS = 6;
+
 // === RESPONSE CACHE ===
 const responseCache = new Map<string, { result: any; timestamp: number }>();
 const CACHE_TTL_MS = 5 * 60 * 1000;
@@ -208,11 +215,22 @@ function isAOInternalMessage(query: string): boolean {
   return AO_INTERNAL_PREFIXES.some((prefix) => trimmed.startsWith(prefix));
 }
 
+// === DOMAIN SPECIFICITY CHECK ===
+function isDomainSpecificQuery(query: string): boolean {
+  const domainKeywords = [
+    "invoice", "po", "purchase order", "reconcil", "payment",
+    "worktree", "task", "ao ", "repository", "git", "branch",
+    // add your actual business domain keywords here
+  ];
+  const lower = query.toLowerCase();
+  return domainKeywords.some(kw => lower.includes(kw));
+}
+
 // === HISTORY SANITIZATION (no-intent / direct-answer path) ===
 const DSML_BLOCK_PATTERN =
   /<｜｜DSML｜｜[^>]*>[\s\S]*?<\/｜｜DSML｜｜[^>]*>|<｜｜DSML｜｜[^>]*>/g;
 
-const DIRECT_ANSWER_HISTORY_LIMIT = 40; // Increased from 20 to reduce pair-breaking
+const DIRECT_ANSWER_HISTORY_LIMIT = 40;
 
 function sanitizeMessageContent(content: any): any {
   if (typeof content === "string") {
@@ -231,38 +249,26 @@ function sanitizeMessageContent(content: any): any {
   return content;
 }
 
-/**
- * Trims an array of non‑system messages to `limit` entries,
- * but ensures that any `tool` message at the start of the trimmed
- * window is preceded by its corresponding assistant `tool_calls` message.
- */
 function trimMessagesPreservingTools(messages: any[], limit: number): any[] {
   if (messages.length <= limit) return messages;
 
   let startIndex = messages.length - limit;
-  // Look for the first tool message in the trimmed range
   for (let i = startIndex; i < messages.length; i++) {
     if (messages[i].role === "tool") {
-      // Back up to find the preceding assistant message
       let j = i - 1;
       while (j >= 0 && messages[j].role !== "assistant") {
         j--;
       }
-      // If that assistant message is before our current start, adjust
       if (j >= 0 && j < startIndex) {
         startIndex = j;
       }
-      break; // Only need to fix the first orphan
+      break;
     }
   }
   return messages.slice(startIndex);
 }
 
 function sanitizeMessagesForDirectAnswer(messages: any[]): any[] {
-  // We no longer filter out messages that contain DSML tool calls,
-  // because we now parse and return proper tool_calls to the client.
-  // Instead, we only sanitize content strings to remove any residual DSML.
-
   const systemMessages = messages.filter((m: any) => m.role === "system");
   const nonSystemMessages = messages.filter((m: any) => m.role !== "system");
 
@@ -308,12 +314,42 @@ function sanitizeMessagesForDirectAnswer(messages: any[]): any[] {
   return sanitized;
 }
 
-// Additional sanitization for direct answer path
-function sanitizeAndPrepareDirectMessages(messages: any[]): any[] {
-  // First sanitize existing messages
+// FIX: sanitizeAndPrepareDirectMessages now accepts forceNoMoreTools so the
+// system message itself tells the model tools are off, instead of just
+// silently omitting `tools` from the API body. This keeps the model's
+// stated instructions in sync with what's actually available to it.
+function sanitizeAndPrepareDirectMessages(
+  messages: any[],
+  forceNoMoreTools: boolean = false,
+): any[] {
+  // First sanitize existing messages (removes DSML artifacts)
   const sanitized = sanitizeMessagesForDirectAnswer(messages);
 
-  // Ensure the LAST message (user query) has explicit instructions
+  // Replace or prepend a strict system message that allows tools but demands a concise answer.
+  const systemMessage = {
+    role: "system",
+    content: forceNoMoreTools
+      ? // FIX: explicit no-tools framing once the round cap is hit, so the
+        // model is told plainly to wrap up rather than being left to infer
+        // it from the absence of a `tools` array.
+        "You are a helpful assistant. You have already gathered enough context from prior tool calls in this conversation. " +
+        "Tools are no longer available for this turn. " +
+        "Answer the user's question directly and completely in plain text now, using the information already gathered. " +
+        "Do not say you need to explore further — give your best answer with what you have."
+      : "You are a helpful assistant with access to tools for reading files in the git worktree. " +
+        "Use tools ONLY if you need to inspect a specific file to answer accurately. " +
+        "Do not say you will explore, check, or look into the repository. " +
+        "Just answer the user's question directly and concisely in plain text.",
+  };
+
+  const systemIndex = sanitized.findIndex((m: any) => m.role === "system");
+  if (systemIndex >= 0) {
+    sanitized[systemIndex] = systemMessage;
+  } else {
+    sanitized.unshift(systemMessage);
+  }
+
+  // Strengthen the last user message with a direct instruction.
   const lastMessage = sanitized[sanitized.length - 1];
   if (lastMessage && lastMessage.role === "user") {
     const originalContent =
@@ -321,31 +357,13 @@ function sanitizeAndPrepareDirectMessages(messages: any[]): any[] {
         ? lastMessage.content
         : JSON.stringify(lastMessage.content);
 
-    // Add explicit instruction to prevent tool call syntax in output
-    lastMessage.content = `${originalContent}\n\n---\nIMPORTANT INSTRUCTIONS FOR YOUR RESPONSE:\n1. Respond with plain text only - DO NOT output any XML tags, function calls, or tool syntax\n2. DO NOT use format like <invoke> or <parameter> or any similar markers\n3. If you need to reference a file, just mention its path in plain text\n4. Answer directly and conversationally`;
-  }
-
-  // Modify system message with stronger instructions
-  const systemIndex = sanitized.findIndex((m: any) => m.role === "system");
-
-  if (systemIndex >= 0) {
-    sanitized[systemIndex] = {
-      ...sanitized[systemIndex],
-      content:
-        sanitized[systemIndex].content +
-        "\n\nCRITICAL RESPONSE FORMAT RULES:\n- Respond in plain text only\n- NEVER output XML tags like <invoke>, <parameter>, or <name>\n- NEVER attempt to make function calls or tool calls\n- If asked about files or code, describe them in prose\n- Do not output JSON or any structured format",
-    };
-  } else {
-    sanitized.unshift({
-      role: "system",
-      content:
-        "You are a helpful AI assistant. Respond with plain text only. Never output XML tags, function calls, or tool syntax. Describe files and code in natural language.",
-    });
+    lastMessage.content = forceNoMoreTools
+      ? `${originalContent}\n\n[Note: Give your final answer now, in plain text, using only the context already gathered. Do not request more tool calls.]`
+      : `${originalContent}\n\n[Note: Answer directly. You may read files if needed, but do not announce exploration.]`;
   }
 
   return sanitized;
 }
-// Add this function after the sanitization functions
 
 function extractToolCallsFromDSML(content: string): {
   content: string | null;
@@ -362,7 +380,6 @@ function extractToolCallsFromDSML(content: string): {
     /<｜｜DSML｜｜invoke name="([^"]+)">([\s\S]*?)<\/｜｜DSML｜｜invoke>/g;
   let match;
 
-  // Extract all invoke blocks
   const invokeBlocks: {
     start: number;
     end: number;
@@ -374,7 +391,6 @@ function extractToolCallsFromDSML(content: string): {
     const name = match[1];
     const paramsBlock = match[2];
 
-    // Parse parameters
     const params: any = {};
     const paramRegex =
       /<｜｜DSML｜｜parameter name="([^"]+)"(?: string="([^"]*)")?>([\s\S]*?)<\/｜｜DSML｜｜parameter>/g;
@@ -382,10 +398,7 @@ function extractToolCallsFromDSML(content: string): {
 
     while ((paramMatch = paramRegex.exec(paramsBlock)) !== null) {
       const paramName = paramMatch[1];
-      // const stringValue = paramMatch[2]; // unused, kept for clarity
       const contentValue = paramMatch[3];
-
-      // Use string attribute if present, otherwise use content
       params[paramName] = contentValue.trim();
     }
 
@@ -397,7 +410,6 @@ function extractToolCallsFromDSML(content: string): {
     });
   }
 
-  // Build tool calls
   invokeBlocks.forEach((block, index) => {
     toolCalls.push({
       id: `call_${randomUUID().substring(0, 8)}`,
@@ -409,11 +421,9 @@ function extractToolCallsFromDSML(content: string): {
     });
   });
 
-  // Extract clean content (text before the tool calls)
   const toolCallsStart = content.indexOf("<｜｜DSML｜｜tool_calls>");
   let cleanContent = content.substring(0, toolCallsStart).trim();
 
-  // If there's content after the tool calls, preserve it
   const toolCallsEnd = content.lastIndexOf("</｜｜DSML｜｜tool_calls>");
   if (
     toolCallsEnd !== -1 &&
@@ -438,9 +448,25 @@ function extractToolCallsFromDSML(content: string): {
     toolCalls: toolCalls.length > 0 ? toolCalls : null,
   };
 }
+
+// FIX: New helper — counts how many assistant turns in the incoming history
+// already requested tool calls. This is derived purely from the `messages`
+// array the client sends back each round, so no new server-side state or
+// session store is needed. Each round trip (tool_calls -> client executes
+// -> appends result -> re-POSTs) adds exactly one such assistant message,
+// so this count is a reliable proxy for "how many tool rounds have already
+// happened in this conversation."
+function countToolRounds(messages: any[]): number {
+  return messages.filter(
+    (m: any) =>
+      m.role === "assistant" &&
+      Array.isArray(m.tool_calls) &&
+      m.tool_calls.length > 0,
+  ).length;
+}
+
 // === DEEPSEEK API CALLS ===
 
-// Non-streaming (for student model - more reliable)
 async function callDeepSeekNonStreaming(
   model: string,
   messages: any[],
@@ -516,7 +542,6 @@ async function callDeepSeekNonStreaming(
   }
 }
 
-// Streaming (for teacher model)
 async function callDeepSeekStreaming(
   model: string,
   messages: any[],
@@ -631,7 +656,6 @@ async function callDeepSeekStreaming(
   }
 }
 
-// Non-streaming with tools
 async function callDeepSeekRaw(
   model: string,
   messages: any[],
@@ -670,6 +694,14 @@ async function callDeepSeekRaw(
       body.tools = options.tools;
       if (options.tool_choice !== undefined)
         body.tool_choice = options.tool_choice;
+    } else if (options.tool_choice !== undefined) {
+      // FIX: previously, tool_choice was only ever sent when a non-empty
+      // `tools` array was also present. That meant a forced "none" could
+      // silently get dropped in code paths that pass tools=undefined but
+      // still want to explicitly say "no tools this turn." Harmless to
+      // include tool_choice: "none" even with no tools array, and it makes
+      // the intent explicit in the request body for debugging.
+      body.tool_choice = options.tool_choice;
     }
 
     console.log(
@@ -677,6 +709,11 @@ async function callDeepSeekRaw(
     );
     if (options.tools && options.tools.length > 0) {
       console.log(`[DeepSeekRaw] Tools available: ${options.tools.length}`);
+    } else {
+      console.log(`[DeepSeekRaw] Tools available: 0`);
+    }
+    if (options.tool_choice !== undefined) {
+      console.log(`[DeepSeekRaw] tool_choice: ${JSON.stringify(options.tool_choice)}`);
     }
 
     const response = await axios.post(
@@ -897,6 +934,14 @@ async function triggerLearningLoopOnNoIntent(
   userQuery: string,
   traceId: string,
 ): Promise<void> {
+  // Only bootstrap if query is domain‑specific
+  if (!isDomainSpecificQuery(userQuery)) {
+    console.log(
+      `[LearningLoop] Skipping bootstrap – query not domain-specific: "${userQuery.substring(0, 80)}"`,
+    );
+    return;
+  }
+
   try {
     console.log(
       `[LearningLoop] (post-response) No-intent trigger for trace ${traceId}`,
@@ -987,41 +1032,57 @@ async function cascadePipeline(
       return { trace_id: traceId, path: "no_intent", status: "forward" };
     }
 
+    // Declare intentName BEFORE any usage
     const intentName = bundle.routing_metadata.intent_name;
     console.log(`[Cascade] Matched intent: ${intentName}`);
+
+    // Check if intent is a proper domain task (not auto‑learned for non‑domain)
+    const isUnstructuredIntent =
+      bundle?.routing_metadata?.domain === "auto_learned" &&
+      (!bundle.verification_assets.layer1_schema ||
+       Object.keys(bundle.verification_assets.layer1_schema.properties || {}).length === 0) ||
+      (bundle.verification_assets.layer1_schema?.type !== "object");
+
+    const isNonDomainIntent =
+      !isDomainSpecificQuery(userQuery) && bundle?.routing_metadata?.domain === "auto_learned";
+
+    if (isUnstructuredIntent || isNonDomainIntent) {
+      console.log(
+        `[Cascade] Intent "${intentName}" is not a structured domain task, forwarding to direct path`,
+      );
+      return { trace_id: traceId, path: "no_intent", status: "forward_to_direct" };
+    }
 
     const queryLower = userQuery.toLowerCase();
     const isCodeQuery = [
       "write", "create", "implement", "add", "fix", "update", "modify",
       "code", "function", "method", "class", "api", "endpoint",
       "placeholder", "integrate", "refactor", "debug", "test",
-      "build", "setup", "configure", "show api endpoints"
+      "build", "setup", "configure", "show api endpoints",
+      // FIX: the trace in this conversation ("find improvement that can be
+      // done to improve the speed and reliability of the yolo model...")
+      // matched none of the original keywords and fell through to the
+      // general path instead, where tool_choice defaults to whatever the
+      // client sent (often "auto"). Adding performance/optimization
+      // vocabulary so analysis-of-code requests like this get routed the
+      // same way as other coding tasks.
+      "improve", "improvement", "optimi", "performance", "speed up",
+      "make faster", "reliability", "bottleneck",
     ].some((kw) => queryLower.includes(kw));
 
-    // Check if this is an unstructured code query that should be sent to the direct path
-    // OR if it's an auto-learned intent that failed to bootstrap properly (has weird names)
-    // "auto_learned" intents are generated dynamically and often lack a good schema, 
-    // leading to empty output that fails the gates.
-    const isMalformedIntent = intentName.includes("__system_reminder__") || 
-      bundle?.routing_metadata?.domain === "auto_learned" || 
-      bundle?.domain === "auto_learned" || 
-      /_\d{10,}$/.test(intentName) ||
-      (bundle?.verification_assets?.layer1_schema?.properties && Object.keys(bundle.verification_assets.layer1_schema.properties).length === 0) ||
-      (bundle?.verification_assets?.layer1_schema?.type === "object" && Object.keys(bundle.verification_assets.layer1_schema).length === 2 && bundle.verification_assets.layer1_schema.properties);
-    
-    // Check cache
-    const cacheKey = getCacheKey(userQuery, intentName);
-
-    // Ignore cache if malformed
-    if (isMalformedIntent || isCodeQuery) {
-      console.log(`[Cascade] Code query or malformed intent detected, skipping domain cascade for: ${intentName}`);
-      deleteCachedResponse(cacheKey); // Remove bad cache entry
+    // If it's a code query, also forward to direct path (even if intent matched)
+    if (isCodeQuery) {
+      console.log(`[Cascade] Code query detected, forwarding to direct path`);
       return {
         trace_id: traceId,
         path: "code_query",
         status: "forward_to_direct",
       };
     }
+
+    // Check cache
+    const cacheKey = getCacheKey(userQuery, intentName);
+    const cachedResult = getCachedResponse(cacheKey);
     if (cachedResult) {
       console.log(`[Cache] ✅ Hit for "${intentName}"`);
       return { ...cachedResult, cache_hit: true };
@@ -1096,7 +1157,6 @@ async function cascadePipeline(
         throw new Error("Student produced empty or meaningless draft");
       }
 
-      // Check if object has only empty values
       if (typeof studentDraft === "object" && !Array.isArray(studentDraft)) {
         const hasContent = Object.values(studentDraft).some(
           (value: any) =>
@@ -1348,6 +1408,16 @@ app.post("/v1/chat/completions", async (req, res) => {
       console.log(`[Router] Incoming tools: ${incomingTools.length}`);
     }
 
+    // FIX: compute the tool-round count once per request, right after we
+    // have `messages`, and log it every time. This is the single source of
+    // truth used by every downstream branch to decide whether tools should
+    // still be offered this turn.
+    const toolRoundsSoFar = countToolRounds(messages);
+    const forceNoMoreTools = toolRoundsSoFar >= MAX_TOOL_ROUNDS;
+    console.log(
+      `[Router] Tool rounds so far: ${toolRoundsSoFar}/${MAX_TOOL_ROUNDS}${forceNoMoreTools ? " — FORCING FINAL ANSWER, NO MORE TOOLS" : ""}`,
+    );
+
     const userMessages = messages.filter((m: any) => m.role === "user");
     const lastUserMessage = userMessages[userMessages.length - 1];
     let userQuery = "";
@@ -1374,17 +1444,21 @@ app.post("/v1/chat/completions", async (req, res) => {
           STUDENT_MODEL,
           messages,
           {
-            tools:
-              incomingTools && incomingTools.length > 0
+            // FIX: AO internal bypass now also respects the round cap —
+            // previously this branch had no cap awareness at all and could
+            // loop forever independently of the general path fix below.
+            tools: forceNoMoreTools
+              ? undefined
+              : incomingTools && incomingTools.length > 0
                 ? incomingTools
                 : undefined,
-            tool_choice: incomingToolChoice,
-            max_tokens: 4000,
+            tool_choice: forceNoMoreTools ? "none" : incomingToolChoice,
+            max_tokens: 8000,
           },
           requestSpan,
         );
         let finalContent = result.content;
-        let finalToolCalls = result.toolCalls;
+        let finalToolCalls = forceNoMoreTools ? null : result.toolCalls;
 
         if (
           !finalToolCalls &&
@@ -1393,15 +1467,13 @@ app.post("/v1/chat/completions", async (req, res) => {
         ) {
           const parsed = extractToolCallsFromDSML(finalContent);
           finalContent = parsed.content;
-          finalToolCalls = parsed.toolCalls;
+          finalToolCalls = forceNoMoreTools ? null : parsed.toolCalls;
         }
 
-        // Check for tool calls (now includes DSML-extracted)
         if (finalToolCalls && finalToolCalls.length > 0) {
           console.log(
             `[Router] Model requested ${finalToolCalls.length} tool call(s)`,
           );
-          // Use a new traceId for AO internal responses; cascadeResult not available here
           return sendChatResponse(res, {
             traceId: randomUUID(),
             modelUsed: "deepseek-direct",
@@ -1445,7 +1517,6 @@ app.post("/v1/chat/completions", async (req, res) => {
     let content = "";
     let modelUsed = modelRequested;
 
-    // Handle different cascade paths
     if (cascadeResult.path === "error") {
       console.error("[Router] Cascade pipeline error:", cascadeResult.error);
       return sendChatResponse(res, {
@@ -1475,41 +1546,54 @@ app.post("/v1/chat/completions", async (req, res) => {
         let toolChoiceToUse;
 
         if (isCodeQuery) {
-          // For code queries: preserve tools, use sanitized history
+          // FIX: honor forceNoMoreTools in the code-query branch too. This
+          // branch previously always preserved incomingTools verbatim
+          // regardless of how many rounds had already happened — it was
+          // just as capable of looping forever as the general path.
           directMessages = sanitizeMessagesForDirectAnswer(messages);
-          toolsToUse =
-            incomingTools && incomingTools.length > 0
+          toolsToUse = forceNoMoreTools
+            ? undefined
+            : incomingTools && incomingTools.length > 0
               ? incomingTools
               : undefined;
-          toolChoiceToUse = incomingToolChoice;
+          toolChoiceToUse = forceNoMoreTools ? "none" : incomingToolChoice;
 
           console.log(
             `[Router] Code query - preserving ${toolsToUse?.length || 0} tools`,
           );
 
-          // Enhance system prompt for code queries
+          const codeSystemAddition = forceNoMoreTools
+            ? "\n\nYou are a coding assistant. You have already gathered enough context from prior tool calls. " +
+              "Tools are no longer available for this turn. Give your complete final answer now in plain text: " +
+              "explain what you found and what changes are needed, using only the context already gathered."
+            : "\n\nYou are a coding assistant. Use the available tools to explore the codebase, read files, and implement the requested changes. Provide detailed explanations of what you find and what changes need to be made.";
+
           const systemIndex = directMessages.findIndex(
             (m: any) => m.role === "system",
           );
           if (systemIndex >= 0) {
             directMessages[systemIndex] = {
               ...directMessages[systemIndex],
-              content:
-                directMessages[systemIndex].content +
-                "\n\nYou are a coding assistant. Use the available tools to explore the codebase, read files, and implement the requested changes. Provide detailed explanations of what you find and what changes need to be made.",
+              content: directMessages[systemIndex].content + codeSystemAddition,
             };
           } else {
             directMessages.unshift({
               role: "system",
-              content:
-                "You are a coding assistant. Use the available tools to explore the codebase, read files, and implement the requested changes. Provide detailed explanations of what you find and what changes need to be made.",
+              content: codeSystemAddition.trim(),
             });
           }
         } else {
-          // For general queries: no tools, enhanced sanitization
-          directMessages = sanitizeAndPrepareDirectMessages(messages);
-          toolsToUse = undefined;
-          toolChoiceToUse = undefined;
+          // For general/no-intent path: keep tools but instruct model to answer directly
+          // FIX: pass forceNoMoreTools through so the system message and the
+          // actual tools array agree with each other.
+          directMessages = sanitizeAndPrepareDirectMessages(messages, forceNoMoreTools);
+          toolsToUse = forceNoMoreTools
+            ? undefined
+            : incomingTools && incomingTools.length > 0
+              ? incomingTools
+              : undefined;
+          toolChoiceToUse = forceNoMoreTools ? "none" : incomingToolChoice;
+          console.log(`[Router] General query - tools available but plain text answer expected`);
         }
 
         const result = await callDeepSeekRaw(
@@ -1518,20 +1602,40 @@ app.post("/v1/chat/completions", async (req, res) => {
           {
             tools: toolsToUse,
             tool_choice: toolChoiceToUse,
-            max_tokens: 4000, // Increased from 2000
+            max_tokens: 8000,
             temperature: 0.3,
           },
           requestSpan,
         );
 
-        // Parse DSML if present
         if (result.content && result.content.includes("<｜｜DSML｜｜tool_calls>")) {
           const parsed = extractToolCallsFromDSML(result.content);
           result.content = parsed.content;
-          result.toolCalls = parsed.toolCalls;
+          // FIX: even DSML-embedded tool calls must not survive once the
+          // round cap has been hit — otherwise a model that "sneaks" tool
+          // calls into plain content past the cap would still loop.
+          result.toolCalls = forceNoMoreTools ? null : parsed.toolCalls;
         }
 
-        // Check for tool calls first
+        // FIX: belt-and-suspenders — if tools were forced off this round,
+        // strip any tool_calls the API returned anyway before we act on
+        // them. This should be redundant given tools=undefined/tool_choice
+        // ="none" above, but guards against provider quirks.
+        if (forceNoMoreTools && result.toolCalls) {
+          console.log(
+            `[Router] Round cap active — discarding ${result.toolCalls.length} unexpected tool call(s) from response`,
+          );
+          result.toolCalls = null;
+        }
+
+        // Helper to detect too-short responses
+        const isTooShort = (text: string | null) =>
+          !text ||
+          text.trim().length < 10 ||
+          text.trim() === "{}" ||
+          text.trim() === "[]";
+
+        // If the initial call already has tool calls, send them immediately.
         if (result.toolCalls && result.toolCalls.length > 0) {
           console.log(
             `[Router] Model requested ${result.toolCalls.length} tool call(s)`,
@@ -1547,17 +1651,18 @@ app.post("/v1/chat/completions", async (req, res) => {
           });
         }
 
-        // Helper to detect too-short responses
-        const isTooShort = (text: string | null) =>
-          !text ||
-          text.trim().length < 10 ||
-          text.trim() === "{}" ||
-          text.trim() === "[]";
+        // FIX: a finish_reason of "length" means the response was truncated
+        // mid-generation — the original code only retried on isTooShort(),
+        // so a truncated-but-not-short response would previously be sent to
+        // the user as if it were complete. Truncation is now also a retry
+        // trigger, tracked separately so we can log which case fired.
+        const wasTruncated = result.finishReason === "length";
 
-        if (isTooShort(result.content)) {
-          console.error("[Router] Response too short or empty, retrying with same history");
+        if (isTooShort(result.content) || wasTruncated) {
+          console.error(
+            `[Router] Retrying (reason: ${wasTruncated ? "truncated (finish_reason=length)" : "too short/empty"})`,
+          );
 
-          // Retry using the same directMessages, with higher max_tokens and stronger prompt
           const retryMessages = directMessages.map((m: any) => ({
             ...m,
             content: m.role === "system"
@@ -1565,26 +1670,37 @@ app.post("/v1/chat/completions", async (req, res) => {
               : m.content,
           }));
 
+          // FIX: this is the core of the second bug. The retry previously
+          // reused toolsToUse/toolChoiceToUse unchanged, so a truncated
+          // response with tool_choice="auto" could retry straight into
+          // *more* tool calls (exactly what the pasted trace showed: retry
+          // produced 3 tool calls). The retry's only job is to get a
+          // complete text answer, so tools are forced off unconditionally
+          // here regardless of forceNoMoreTools — retrying is not the
+          // moment to invite another detour.
           const retryResult = await callDeepSeekRaw(
             STUDENT_MODEL,
             retryMessages,
             {
-              tools: toolsToUse,
-              tool_choice: toolChoiceToUse,
-              max_tokens: 8000, // Even higher for retry
+              tools: undefined,
+              tool_choice: "none",
+              max_tokens: 12000,
               temperature: 0.3,
             },
             requestSpan,
           );
 
-          // Replace result with retry
           result.content = retryResult.content;
-          result.toolCalls = retryResult.toolCalls;
+          // FIX: tools were not offered on the retry, so there cannot be
+          // legitimate tool calls in the result. Force null rather than
+          // trusting retryResult.toolCalls, closing off the path that let
+          // the original retry re-enter the tool-call loop.
+          result.toolCalls = null;
           result.finishReason = retryResult.finishReason;
         }
 
-        // If after retry still too short, fallback to error message
-        if (isTooShort(result.content)) {
+        // If still too short and no tool calls, fall back to error message.
+        if (isTooShort(result.content) && !(result.toolCalls && result.toolCalls.length > 0)) {
           console.error("[Router] Still getting too short response");
           res.once("finish", () => {
             triggerLearningLoopOnNoIntent(
@@ -1763,6 +1879,7 @@ app.get("/health", (req, res) => {
     cache_size: responseCache.size,
     deepseek_url: DEEPSEEK_URL,
     api_key_present: !!DEEPSEEK_API_KEY,
+    max_tool_rounds: MAX_TOOL_ROUNDS,
   });
 });
 
@@ -1781,6 +1898,7 @@ async function startServer() {
   );
   console.log(`Student Model: ${STUDENT_MODEL}`);
   console.log(`Teacher Model: ${TEACHER_MODEL}`);
+  console.log(`Max Tool Rounds: ${MAX_TOOL_ROUNDS}`);
   console.log("====================\n");
 
   process.on("SIGTERM", async () => {
@@ -1794,6 +1912,7 @@ async function startServer() {
     console.log(`Cascade v3 Router on http://localhost:${PORT}`);
     console.log(`Student: ${STUDENT_MODEL}`);
     console.log(`Teacher: ${TEACHER_MODEL}`);
+    console.log(`Max Tool Rounds: ${MAX_TOOL_ROUNDS}`);
     console.log(
       `Telemetry: ${isTelemetryReady() ? "✅ Ready" : "❌ Not initialized"}`,
     );
