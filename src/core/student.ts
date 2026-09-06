@@ -162,10 +162,14 @@ export async function generateDraft(
       ? `\n\nRequired output schema (follow this EXACTLY):\n${JSON.stringify(schema, null, 2)}`
       : "";
 
-    // Inject REAL time so it overrides any database examples
+    // Inject REAL time so it overrides any database examples, and strictly forbid tools
     const systemPrompt = `You are a precise task execution agent. 
 Output ONLY a valid JSON object matching the schema. No markdown, no arrays, no extra fields, no explanations.
-If the schema asks for a date or timestamp, use the CURRENT SYSTEM CONTEXT below, NOT the examples in the schema.
+
+CRITICAL INSTRUCTION: You DO NOT have access to any external tools, bash, or git environments. 
+DO NOT output <｜｜DSML｜｜tool_calls> tags. 
+DO NOT attempt to run commands. 
+Just generate the final JSON draft.
 
 CURRENT SYSTEM CONTEXT:
 - Current Date/Time: ${new Date().toISOString()}
@@ -177,12 +181,18 @@ CURRENT SYSTEM CONTEXT:
       systemPrompt,
     );
 
+    // Scrub out any accidental DSML tool calls before parsing
+    const cleanOutput = rawOutput
+      .replace(/<｜｜DSML｜｜tool_calls>[\s\S]*?<\/｜｜DSML｜｜tool_calls>/g, "")
+      .replace(/<｜｜DSML｜｜invoke[\s\S]*?<\/｜｜DSML｜｜invoke>/g, "")
+      .trim();
+
     // DONT truncate this string! We need to see it to fix the JSON error.
     console.log(
-      `\n=== STUDENT RAW OUTPUT ===\n${rawOutput}\n==========================\n`,
+      `\n=== STUDENT RAW OUTPUT ===\n${cleanOutput}\n==========================\n`,
     );
 
-    const draft: StudentDraftPayload = extractJSON(rawOutput);
+    const draft: StudentDraftPayload = extractJSON(cleanOutput);
 
     if (!draft) {
       console.log(
@@ -192,7 +202,7 @@ CURRENT SYSTEM CONTEXT:
       setSpanAttributes(span, {
         status: 'invalid_json',
         latency_ms: Date.now() - startTime,
-        raw_output_length: rawOutput.length,
+        raw_output_length: cleanOutput.length,
       });
       
       throw new Error('Student failed to produce valid JSON');
