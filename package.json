@@ -18,6 +18,7 @@
     "better-sqlite3": "^13.0.3",
     "dotenv": "^17.4.2",
     "express": "^5.2.1",
+    "neatlogs": "^1.1.19",
     "pg": "^8.23.0",
     "simple-git": "^3.36.0",
     "zod": "^4.5.4"
