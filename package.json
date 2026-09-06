@@ -22,6 +22,7 @@
     "zod": "^4.5.4"
   },
   "scripts": {
+    "build": "tsc && cp src/gate/layer2_gate.py dist/gate/layer2_gate.py",
     "contract:emit": "prisma contract emit",
     "postinstall": "prisma skills sync || exit 0",
     "ao-router": "bun main.js",
