@@ -188,7 +188,7 @@ export class AsyncLearningLoop {
       const version = await this.promoteToProduction(newContract, span);
 
       console.log(
-        `[LearningLoop] ✅ New contract promoted to production v${version}`,
+        `[LearningLoop]  New contract promoted to production v${version}`,
       );
       console.log(
         `[LearningLoop] Mutation catch rate: ${mutationResults.catchRate}/${mutationResults.total}`,
@@ -310,7 +310,7 @@ export class AsyncLearningLoop {
 
       await client.query("BEGIN");
 
-      // ✅ STEP 1: Insert the intent FIRST and get its ID
+      //  STEP 1: Insert the intent FIRST and get its ID
       const intentResult = await client.query(
         `INSERT INTO intents (id, name, domain, schema_json, status)
          VALUES ($1, $2, $3, $4::json, 'active')
@@ -318,11 +318,11 @@ export class AsyncLearningLoop {
         [intentId, intentName, "auto_learned", schemaJson],
       );
 
-      // ✅ STEP 2: Declare newIntentId BEFORE using it
+      //  STEP 2: Declare newIntentId BEFORE using it
       const newIntentId = intentResult.rows[0].id;
       console.log(`[LearningLoop] Created intent with ID: ${newIntentId}`);
 
-      // ✅ STEP 3: Now use newIntentId in subsequent queries
+      //  STEP 3: Now use newIntentId in subsequent queries
       await client.query(
         `INSERT INTO intent_embeddings (id, intent_id, name, description, embedding_vector)
          VALUES ($1, $2, $3, $4, $5::vector)`,
@@ -348,7 +348,7 @@ export class AsyncLearningLoop {
       await client.query("COMMIT");
 
       console.log(
-        `[LearningLoop] ✅ Bootstrapped intent "${intentName}" (${newIntentId})`,
+        `[LearningLoop]  Bootstrapped intent "${intentName}" (${newIntentId})`,
       );
 
       setSpanAttributes(span, {
@@ -443,9 +443,9 @@ export class AsyncLearningLoop {
         results.push(result);
         if (result.caught) {
           caught++;
-          console.log(`[LearningLoop] ✅ Caught: ${mutation.name}`);
+          console.log(`[LearningLoop]  Caught: ${mutation.name}`);
         } else {
-          console.log(`[LearningLoop] ❌ Missed: ${mutation.name}`);
+          console.log(`[LearningLoop]  Missed: ${mutation.name}`);
         }
       }
 

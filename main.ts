@@ -84,11 +84,9 @@ function loadConfig(): any {
           .replace(/\/\*[\s\S]*?\*\//g, "")
           .replace(/(^|[^:])\/\/.*$/gm, "$1");
         const config = JSON.parse(cleanRaw);
-        console.log(`[Config] Loaded: ${loc}`);
         return config;
       }
     } catch (e) {
-      console.log(`[Config] Failed: ${loc}`);
     }
   }
   throw new Error("opencode config not found");
@@ -107,10 +105,6 @@ const STUDENT_MODEL = "deepseek-v4-flash";
 const TEACHER_MODEL = "deepseek-v4-pro";
 
 // Log API key status (masked)
-console.log(`[Config] DeepSeek URL: ${DEEPSEEK_URL}`);
-console.log(
-  `[Config] API Key: ${DEEPSEEK_API_KEY ? "✅ Present" : "❌ Missing"}`,
-);
 console.log(`[Config] Student Model: ${STUDENT_MODEL}`);
 console.log(`[Config] Teacher Model: ${TEACHER_MODEL}`);
 
@@ -812,7 +806,7 @@ function formatReconciliationResponse(draft: any): string {
 
   if (draft.summary && (draft.matches || draft.unmatched_invoices)) {
     const summary = draft.summary;
-    let response = `📋 **Reconciliation Results**\n\n`;
+    let response = ` **Reconciliation Results**\n\n`;
 
     const normalizeId = (id: string) => {
       return String(id).replace(/^(INV|PO|inv|po)[-#_\s]*/i, "");
@@ -1084,7 +1078,7 @@ async function cascadePipeline(
     const cacheKey = getCacheKey(userQuery, intentName);
     const cachedResult = getCachedResponse(cacheKey);
     if (cachedResult) {
-      console.log(`[Cache] ✅ Hit for "${intentName}"`);
+      console.log(`[Cache]  Hit for "${intentName}"`);
       return { ...cachedResult, cache_hit: true };
     }
 
@@ -1894,7 +1888,7 @@ async function startServer() {
   console.log("\n=== Configuration ===");
   console.log(`DeepSeek URL: ${DEEPSEEK_URL}`);
   console.log(
-    `API Key: ${DEEPSEEK_API_KEY ? "✅ Present (length: " + DEEPSEEK_API_KEY.length + ")" : "❌ Missing"}`,
+    `API Key: ${DEEPSEEK_API_KEY ? " Present (length: " + DEEPSEEK_API_KEY.length + ")" : " Missing"}`,
   );
   console.log(`Student Model: ${STUDENT_MODEL}`);
   console.log(`Teacher Model: ${TEACHER_MODEL}`);
@@ -1914,7 +1908,7 @@ async function startServer() {
     console.log(`Teacher: ${TEACHER_MODEL}`);
     console.log(`Max Tool Rounds: ${MAX_TOOL_ROUNDS}`);
     console.log(
-      `Telemetry: ${isTelemetryReady() ? "✅ Ready" : "❌ Not initialized"}`,
+      `Telemetry: ${isTelemetryReady() ? " Ready" : " Not initialized"}`,
     );
     console.log(`Cache: Enabled (TTL: 5min)`);
     console.log(`========================================\n`);

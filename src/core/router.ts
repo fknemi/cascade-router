@@ -121,7 +121,7 @@ export async function routeIntent(
     });
 
     if (match.distance > MAX_DISTANCE) {
-      console.log(`[Router] ❌ No intent within max distance (${match.distance.toFixed(4)} > ${MAX_DISTANCE})`);
+      console.log(`[Router]  No intent within max distance (${match.distance.toFixed(4)} > ${MAX_DISTANCE})`);
       setSpanAttributes(span, {
         status:          "no_match",
         reason:          "max_distance_exceeded",
@@ -221,7 +221,7 @@ export async function routeIntent(
       latency_ms:  Date.now() - startTime,
     });
 
-    console.log(`[Router] ✅ Matched intent: ${match.name} (distance: ${match.distance.toFixed(4)})`);
+    console.log(`[Router]  Matched intent: ${match.name} (distance: ${match.distance.toFixed(4)})`);
     return bundle;
 
   } catch (error: any) {

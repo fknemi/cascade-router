@@ -287,7 +287,7 @@ export async function layer2Validate(
       const hasError = output.includes("ERROR");
       const passed = hasPass && !hasFail && !hasError;
 
-      console.log(`[Layer 2] ${passed ? '✅ PASSED' : '❌ FAILED'} (${executionMs}ms)`);
+      console.log(`[Layer 2] ${passed ? ' PASSED' : ' FAILED'} (${executionMs}ms)`);
       
       if (!passed) {
         console.log(`[Layer 2] Output: ${output}`);
@@ -324,7 +324,7 @@ export async function layer2Validate(
       const output = error.message;
       const timedOut = error.message.includes('timeout');
       
-      console.log(`[Layer 2] ❌ FAILED (${executionMs}ms): ${output}`);
+      console.log(`[Layer 2]  FAILED (${executionMs}ms): ${output}`);
       
       // Set telemetry attributes for failure
       setSpanAttributes(span, {
