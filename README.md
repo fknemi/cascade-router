@@ -1,30 +1,151 @@
-# Cascade v3
+# Cascade-Router
 
-**Inference-time agent execution framework that gets frontier-model reliability at micro-model cost.**
-
-Instead of using an expensive LLM to judge another LLM's output, Cascade uses deterministic code checks. A cheap, fast "Student" model drafts answers. A verification gate checks them with real code (schema validation + Python invariants). If it passes, you get the answer in ~1.5s for $0.005. If it fails, Cascade auto-routes to a "Teacher" model (frontier-class) for the reliable path. Every Teacher success gets distilled into new invariants, so the system gets smarter over time.
+Cascade is an inference-time agent execution framework designed for hackathons to get frontier-model reliability at micro-model cost. Instead of using an expensive LLM as a judge, it uses deterministic code checks. A fast/cheap "Student" model drafts an answer, which is verified against a JSON schema and sandboxed Python invariants. If verification passes, it returns instantly. If it fails, it falls back to a highly capable "Teacher" model.
 
 ---
 
-## Quick Start
+## File Structure
 
-**1. Install dependencies**
+```text
+.
+├── main.ts                 # Main server entry point
+├── prisma/
+│   └── schema.prisma       # Database schema and models
+├── scripts/
+│   ├── setup-db.sh         # PostgreSQL + pgvector initialization script
+│   ├── test-gate.ts        # Test script for the verification gate
+│   ├── test-router.ts      # Test script for intent routing
+│   └── test-student.ts     # Test script for Student model execution
+├── opencode.json           # OpenCode integration config
+├── package.json            # Project dependencies
+└── .env                    # Environment variables
+
+```
+
+---
+
+## Setup Instructions
+
+**Prerequisites:** You need [Bun](https://bun.sh/) and [Docker](https://www.docker.com/) installed on your machine.
+
+### 1. Install Dependencies
 
 ```bash
 bun install
 
 ```
 
-**2. Set your API key**
+### 2. Setup PostgreSQL + pgvector Database
+
+Create a script named `setup-db.sh` in your project root or `scripts/` folder and run it to initialize the database via Docker.
 
 ```bash
-cp .env.example .env
-# Edit .env → add your DeepSeek API key
+#!/bin/bash
+set -e
+
+echo "1. Stopping and removing any existing container..."
+docker rm -f cascade_pgvector 2>/dev/null || true
+docker volume rm cascade_pg_data 2>/dev/null || true
+
+echo "2. Starting fresh PostgreSQL with pgvector..."
+docker run -d \
+  --name cascade_pgvector \
+  -e POSTGRES_USER=cascade \
+  -e POSTGRES_PASSWORD=cascade_dev_password \
+  -e POSTGRES_DB=cascade \
+  -p 5432:5432 \
+  -v cascade_pg_data:/var/lib/postgresql/data \
+  pgvector/pgvector:pg16
+
+echo "3. Waiting for database to be ready..."
+until docker exec cascade_pgvector pg_isready -U cascade >/dev/null 2>&1; do
+  sleep 1
+done
+echo "   Database is ready!"
+
+echo "4. Enabling pgvector extension..."
+docker exec cascade_pgvector psql -U cascade -d cascade -c "CREATE EXTENSION IF NOT EXISTS vector;"
+
+echo "5. Emitting Prisma contract..."
+bunx prisma contract emit
+
+echo "6. Initializing database schema..."
+export DATABASE_URL="postgres://cascade:cascade_dev_password@localhost:5432/cascade"
+bunx prisma db init
+
+echo "7. Adding native vector column..."
+docker exec cascade_pgvector psql -U cascade -d cascade -c "ALTER TABLE intent_embeddings ADD COLUMN IF NOT EXISTS embedding_vector vector(768);"
+
+echo "8. Creating HNSW index for cosine similarity..."
+docker exec cascade_pgvector psql -U cascade -d cascade -c "CREATE INDEX IF NOT EXISTS embedding_vector_hnsw_idx ON intent_embeddings USING hnsw (embedding_vector vector_cosine_ops);"
+
+echo ""
+echo "   ✅ Setup Complete!"
+echo "   Connection: postgres://cascade:cascade_dev_password@localhost:5432/cascade"
+echo "   Container:  cascade_pgvector"
 
 ```
 
-**3. Configure OpenCode Support**
-Cascade natively supports OpenCode. To route your OpenCode workspace through Cascade, add the following to your `opencode.json` or workspace config:
+Run it:
+
+```bash
+bash setup-db.sh
+
+```
+
+### 3. Environment Variables
+
+Create a `.env` file in the root directory and configure it as follows:
+
+```env
+# ─── DeepSeek API Configuration ────────────────────────────────────────────
+DEEPSEEK_API_KEY=your-deepseek-api-key-here
+DEEPSEEK_BASE_URL=https://api.deepseek.com
+
+# ─── Student/Teacher Models ────────────────────────────────────────────────
+STUDENT_MODEL=deepseek-v4-flash
+TEACHER_MODEL=deepseek-v4-pro
+
+# ─── Neatlogs Telemetry ────────────────────────────────────────────────────
+NEATLOGS_API_KEY=your-neatlogs-api-key-here
+
+# ─── Database Configuration ────────────────────────────────────────────────
+DATABASE_URL=postgresql://cascade:cascade_dev_password@localhost:5432/cascade
+PGHOST=localhost
+PGPORT=5432
+PGUSER=cascade
+PGPASSWORD=cascade_dev_password
+PGDATABASE=cascade
+
+# ─── Ollama Configuration ──────────────────────────────────────────────────
+OLLAMA_URL=http://localhost:11434
+OLLAMA_MODEL=nomic-embed-text
+
+# ─── Server Configuration ──────────────────────────────────────────────────
+PORT=3000
+NODE_ENV=development
+
+# ─── Performance Targets ───────────────────────────────────────────────────
+FAST_PATH_LATENCY_MS=1500
+FAST_PATH_COST_USD=0.005
+FALLBACK_COST_USD=0.12
+MUTATION_CATCH_RATE=10
+
+# ─── AO Configuration ──────────────────────────────────────────────────────
+# for windows
+# AO_DB_PATH=C:\Users\<USERNAME>\.ao\data\ao.db 
+# AO_WORKTREES_PATH=C:\Users\<USERNAME>\.ao\data\worktrees
+AO_DB_PATH=~/.ao/data/ao.db
+AO_WORKTREES_PATH=~/.ao/data/worktrees
+
+# ─── Logging ───────────────────────────────────────────────────────────────
+LOG_LEVEL=info
+
+```
+
+### 4. Configure OpenCode
+
+To route your OpenCode workspace through Cascade, add this to your `opencode.json`. Ensure both the `ao-router` and `deepseek` providers are configured side-by-side so OpenCode can utilize both natively.
 
 ```json
 {
@@ -43,12 +164,34 @@ Cascade natively supports OpenCode. To route your OpenCode workspace through Cas
           "name": "Student (Fast Draft)"
         },
         "teacher": {
-          "id": "deepseek/deepseek-v4-flash",
+          "id": "deepseek/deepseek-v4-pro",
           "name": "Teacher (Reliable Fallback)"
         },
         "auto": {
-          "id": "deepseek/deepseek-v4-flash",
+          "id": "deepseek/deepseek-v4-pro",
           "name": "Cascade Router"
+        }
+      }
+    },
+    "deepseek": {
+      "npm": "@ai-sdk/openai-compatible",
+      "options": {
+        "baseURL": "https://api.deepseek.com",
+        "apiKey": ""
+      },
+      "models": {
+        "deepseek-v4-flash": {
+          "id": "deepseek-v4-flash"
+        },
+        "deepseek-v4-flash-vision-exp": {
+          "id": "deepseek-v4-flash-vison-exp"
+        },
+        "deepseek-v4-pro": {
+          "options": {
+            "thinking": {
+              "type": "disabled"
+            }
+          }
         }
       }
     }
@@ -57,33 +200,21 @@ Cascade natively supports OpenCode. To route your OpenCode workspace through Cas
 
 ```
 
-**4. Run the server**
+---
+
+## How to Run
+
+**1. Start the Server**
 
 ```bash
 bun main.ts
 
 ```
 
-*Server starts at `http://localhost:3000*`
+*The server will start at `http://localhost:3000*`
 
----
-
-## What It Does
-
-| Stage | What Happens |
-| --- | --- |
-| **Route** | Matches query to an intent profile (SOP + schema + invariants) |
-| **Draft** | Student model (cheap/fast) generates JSON output |
-| **Verify** | Layer 1 checks structure, Layer 2 runs Python invariant assertions |
-| **Pass** | Result returned instantly (~$0.005) |
-| **Fail** | Auto-fallback to Teacher model (~$0.12, higher reliability) |
-| **Learn** | Teacher success → new invariant synthesized for next time |
-
----
-
-## API Examples
-
-### Basic Chat Completion
+**2. Test the API (Chat Completion)**
+In a new terminal, test the local routing endpoint:
 
 ```bash
 curl -X POST http://localhost:3000/v1/chat/completions \
@@ -97,152 +228,10 @@ curl -X POST http://localhost:3000/v1/chat/completions \
 
 ```
 
-### Streaming Response
+**3. Run Specific Tests (Optional)**
 
 ```bash
-curl -X POST http://localhost:3000/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "auto",
-    "messages": [
-      {"role": "user", "content": "Draft a journal entry for the reconciliation"}
-    ],
-    "stream": true
-  }'
+bun scripts/test-router.ts
+bun scripts/test-gate.ts
 
 ```
-
-### With Tools (Code Queries)
-
-```bash
-curl -X POST http://localhost:3000/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "auto",
-    "messages": [
-      {"role": "user", "content": "Find improvements to speed up the yolo model in this repo"}
-    ],
-    "tools": [
-      {
-        "type": "function",
-        "function": {
-          "name": "read_file",
-          "description": "Read a file from the repo",
-          "parameters": {
-            "type": "object",
-            "properties": {
-              "path": {"type": "string"}
-            }
-          }
-        }
-      }
-    ]
-  }'
-
-```
-
-### Health Check
-
-```bash
-curl http://localhost:3000/health
-
-```
-
----
-
-## Example Intent Bundle
-
-What a matched intent looks like internally:
-
-```json
-{
-  "routing_metadata": {
-    "intent_id": "9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d",
-    "intent_name": "reconcile_and_draft_je",
-    "domain": "month_end_close",
-    "model_target": "llama-3-8b"
-  },
-  "execution_assets": {
-    "sop_version": 3,
-    "sop_text": "Step 1: Check GL account balances. Step 2: Compare to statement debit entries..."
-  },
-  "verification_assets": {
-    "layer1_schema": {
-      "type": "object",
-      "properties": {
-        "matched": {"type": "boolean"},
-        "je": {
-          "type": "object",
-          "properties": {
-            "dr": {"type": "string"},
-            "cr": {"type": "string"},
-            "amount": {"type": "number"}
-          },
-          "required": ["dr", "cr", "amount"]
-        }
-      },
-      "required": ["matched", "je"]
-    },
-    "layer2_invariant_code": "def verify_logic(payload, state):\n    je = payload.get('je', {})\n    assert je.get('dr') == '1010', 'Must use asset account 1010'\n    assert je.get('dr') != je.get('cr'), 'Debits and Credits must balance, not match'"
-  }
-}
-
-```
-
----
-
-## Example Output
-
-```json
-{
-  "id": "cascade-uuid",
-  "model": "cascade-student",
-  "choices": [
-    {
-      "message": {
-        "role": "assistant",
-        "content": "**Reconciliation Results**\n\n**Summary:**\n- Purchase Orders Received: 12\n- Invoices Received: 14\n- Confirmed Matches: 10\n..."
-      },
-      "finish_reason": "stop"
-    }
-  ],
-  "cascade_metadata": {
-    "trace_id": "uuid",
-    "path": "student_fast_path",
-    "status": "passed",
-    "latency_ms": 1200,
-    "cost_usd": 0.005
-  }
-}
-
-```
-
----
-
-## Demo Talking Points
-
-* **"The moat is deterministic verification."** No LLM judging LLMs. Real code asserts real invariants.
-* **"Fast path is 8x cheaper and 10x faster."** ~$0.005 vs $0.12, ~1.5s vs ~12s.
-* **"It self-heals."** Every Teacher success becomes a new invariant. The gate gets stricter automatically.
-* **"Zero side effects during drafting."** Sandboxed execution — nothing commits until the gate passes.
-
----
-
-## Scripts
-
-```bash
-bun run build              # TypeScript build
-bun run contract:emit      # Emit Prisma contract
-bun scripts/test-gate.ts   # Test the verification gate
-bun scripts/test-router.ts # Test intent routing
-bun scripts/test-student.ts # Test Student model
-
-```
-
----
-
-## Troubleshooting
-
-* **API key missing**: Set `DEEPSEEK_API_KEY` in `.env`
-* **Tool call loop**: System caps tool rounds at 6, then forces a final answer. That's intentional.
-* **Prisma not initialized**: Run `bun run contract:emit` first.
